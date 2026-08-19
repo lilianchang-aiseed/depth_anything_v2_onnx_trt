@@ -1,6 +1,13 @@
 gradio_imageslider
 gradio
 matplotlib
+numpy
+onnx
+onnxruntime-gpu
+onnxscript
+onnxslim
 opencv-python
 torch
 torchvision
+tqdm
+typer
