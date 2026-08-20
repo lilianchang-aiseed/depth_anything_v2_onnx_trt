@@ -1,0 +1,12 @@
+# Python dependencies for depth_anything_v2_trt_node.py
+numpy
+opencv-python
+torch
+PyYAML
+
+# System-provided dependencies (do not install from this file):
+# - ROS 2 Humble Python packages: rclpy, sensor_msgs
+# - NVIDIA TensorRT Python bindings: tensorrt
+#
+# On Jetson, install TensorRT through JetPack/apt and use the CUDA-compatible
+# PyTorch build supplied for the installed JetPack version.

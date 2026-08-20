@@ -1,8 +1,9 @@
 """
-usage: 
+modified pth -> onnx file based on below repo: 
+https://github.com/fabio-sim/Depth-Anything-ONNX/tree/main
 
-cd /home/r12543040/tools_rectify_stereo/Depth-Anything-V2
-
+======
+usage
 transform: 
 python3 transform/dynamo.py export \
   --encoder vits \
