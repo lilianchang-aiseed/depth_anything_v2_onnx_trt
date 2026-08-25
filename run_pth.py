@@ -53,10 +53,20 @@ if __name__ == '__main__':
         print(f'Progress {k+1}/{len(filenames)}: {filename}')
         
         raw_image = cv2.imread(filename)
+
+        #test fisheye crop 
+        raw_image = raw_image[205:-205, 154:-154, :]
+        # raw_image = cv2.resize(raw_image, (320, 320))
+        # raw_image = cv2.resize(raw_image[205:-205, 159:-159, :], (320, 320))
         
         depth = depth_anything.infer_image(raw_image, args.input_size)
         
-        depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+        # depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+
+        if k == 0:
+            std=(depth.max() - depth.min())
+        depth = (depth - depth.min()) / std * 255.0
+
         depth = depth.astype(np.uint8)
         
         if args.grayscale:
@@ -65,9 +75,9 @@ if __name__ == '__main__':
             depth = (cmap(depth)[:, :, :3] * 255)[:, :, ::-1].astype(np.uint8)
         
         if args.pred_only:
-            cv2.imwrite(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.png'), depth)
+            cv2.imwrite(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.jpg'), depth)
         else:
             split_region = np.ones((raw_image.shape[0], 50, 3), dtype=np.uint8) * 255
             combined_result = cv2.hconcat([raw_image, split_region, depth])
             
-            cv2.imwrite(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.png'), combined_result)
+            cv2.imwrite(os.path.join(args.outdir, os.path.splitext(os.path.basename(filename))[0] + '.jpg'), combined_result)

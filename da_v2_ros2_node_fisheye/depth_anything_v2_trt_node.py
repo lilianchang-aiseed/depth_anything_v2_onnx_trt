@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""ROS 2 node for multi-pair Depth Anything V2 TensorRT inference.
+"""Four-camera fisheye Depth Anything V2 TensorRT ROS 2 node.
 
-For the fixed pairs 0_3, 1_0, 2_1, and 3_2, subscribe to both rectified
-images and publish a 32FC1 relative-depth image for each input. One latest
-frame slot per input and a round-robin GPU worker prevent stale backlogs and
-keep all eight inputs from starving one another.
+Subscribe to /camera_{0..3}/image_raw and publish a 504x280 32FC1 relative
+depth image on /camera_{id}/relative_depth. Inputs not already 504x280 are
+resized first. Four latest-frame slots and one round-robin GPU worker avoid
+stale queues and camera starvation.
 """
 
 import argparse
@@ -29,9 +29,9 @@ DEFAULT_ENGINE = (
     PROJECT_DIR / "checkpoints" / "depth_anything_v2_vits_dynamic.engine"
 )
 
-STEREO_PAIRS = ((0, 3), (1, 0), (2, 1), (3, 2))
-SIDES = ("left", "right")
-PATCH_SIZE = 14
+CAMERA_IDS = (0, 1, 2, 3)
+INPUT_WIDTH = 504
+INPUT_HEIGHT = 280
 
 
 def _image_msg_to_bgr(message: Image) -> np.ndarray:
@@ -74,23 +74,17 @@ def _image_msg_to_bgr(message: Image) -> np.ndarray:
 
 
 def _prepare_image(image_bgr: np.ndarray):
-    height, width = image_bgr.shape[:2]
-    pad_bottom = (-height) % PATCH_SIZE
-    pad_right = (-width) % PATCH_SIZE
-    padded = cv2.copyMakeBorder(
-        image_bgr,
-        0,
-        pad_bottom,
-        0,
-        pad_right,
-        borderType=cv2.BORDER_REPLICATE,
-    )
-    image = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    resized = image_bgr.shape[:2] != (INPUT_HEIGHT, INPUT_WIDTH)
+    if resized:
+        image_bgr = cv2.resize(
+            image_bgr, (INPUT_WIDTH, INPUT_HEIGHT), interpolation=cv2.INTER_AREA
+        )
+    image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
     image = (image - mean) / std
     tensor = np.ascontiguousarray(image.transpose(2, 0, 1)[None])
-    return tensor, (height, width), padded.shape[:2]
+    return tensor, resized
 
 
 class TensorRTEngine:
@@ -184,7 +178,7 @@ class TensorRTEngine:
 
 class DepthAnythingV2TensorRTNode(Node):
     def __init__(self, engine_path: Path):
-        super().__init__("depth_anything_v2_trt")
+        super().__init__("depth_anything_v2_fisheye_trt")
         if not engine_path.is_file():
             raise FileNotFoundError(engine_path)
 
@@ -196,11 +190,7 @@ class DepthAnythingV2TensorRTNode(Node):
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
         )
-        self._keys = [
-            (left, right, side)
-            for left, right in STEREO_PAIRS
-            for side in SIDES
-        ]
+        self._keys = list(CAMERA_IDS)
         # Do not use Node's reserved _publishers/_subscriptions attribute names.
         self._depth_publishers = {}
         self._image_subscriptions = []
@@ -210,10 +200,10 @@ class DepthAnythingV2TensorRTNode(Node):
         self._round_robin_index = 0
         self._last_statistics_log = 0.0
 
-        for left, right, side in self._keys:
-            input_topic = f"/stereo_{left}_{right}/{side}/image_rect"
-            output_topic = f"/stereo_{left}_{right}/{side}/relative_depth"
-            key = (left, right, side)
+        for camera_id in self._keys:
+            input_topic = f"/camera_{camera_id}/image_raw"
+            output_topic = f"/camera_{camera_id}/relative_depth"
+            key = camera_id
             self._depth_publishers[key] = self.create_publisher(
                 Image, output_topic, 1
             )
@@ -235,7 +225,8 @@ class DepthAnythingV2TensorRTNode(Node):
         )
         self._worker.start()
         self.get_logger().info(
-            f"Ready: {len(self._keys)} rectified image inputs; "
+            f"Ready: {len(self._keys)} fisheye inputs at "
+            f"{INPUT_WIDTH}x{INPUT_HEIGHT}; "
             f"TensorRT input={self._engine.input_name}, "
             f"output={self._engine.output_name}"
         )
@@ -277,17 +268,16 @@ class DepthAnythingV2TensorRTNode(Node):
         try:
             total_started = time.perf_counter()
             image_bgr = _image_msg_to_bgr(message)
-            model_input, original_shape, padded_shape = _prepare_image(image_bgr)
+            model_input, resized = _prepare_image(image_bgr)
             inference_started = time.perf_counter()
             output = self._engine.infer(model_input)
             depth = np.asarray(output, dtype=np.float32).squeeze()
-            if depth.shape != padded_shape:
+            expected_shape = (INPUT_HEIGHT, INPUT_WIDTH)
+            if depth.shape != expected_shape:
                 raise ValueError(
-                    f"Unexpected depth shape {depth.shape}; expected {padded_shape}"
+                    f"Unexpected depth shape {depth.shape}; expected {expected_shape}"
                 )
-
-            height, width = original_shape
-            depth = np.ascontiguousarray(depth[:height, :width], dtype=np.float32)
+            depth = np.ascontiguousarray(depth, dtype=np.float32)
             inference_finished = time.perf_counter()
             self._publish_image(
                 depth, "32FC1", message, self._depth_publishers[key]
@@ -303,7 +293,7 @@ class DepthAnythingV2TensorRTNode(Node):
                 finite = depth[np.isfinite(depth)]
                 if finite.size:
                     self.get_logger().info(
-                        f"stereo_{key[0]}_{key[1]}/{key[2]} depth: "
+                        f"camera_{key} depth: resized={'yes' if resized else 'no'}, "
                         f"min={finite.min():.6f}, max={finite.max():.6f}, "
                         f"mean={finite.mean():.6f}, nonzero={np.count_nonzero(finite)} "
                         f"| prep={prep_ms:.2f} ms, infer={infer_ms:.2f} ms, "
@@ -311,13 +301,12 @@ class DepthAnythingV2TensorRTNode(Node):
                     )
                 else:
                     self.get_logger().error(
-                        f"stereo_{key[0]}_{key[1]}/{key[2]} output has no finite values"
+                        f"camera_{key} output has no finite values"
                     )
                 self._last_statistics_log = now
         except Exception as exc:
-            left, right, side = key
             self.get_logger().error(
-                f"Depth Anything failed for stereo_{left}_{right}/{side}: {exc}"
+                f"Depth Anything failed for camera_{key}: {exc}"
             )
 
     def destroy_node(self):
@@ -356,7 +345,7 @@ def _parse_arguments(args=None):
     parser.add_argument(
         "--test-image",
         type=Path,
-        help="Run one offline 320x320 test image instead of starting ROS 2",
+        help="Run one offline 504x280 test image instead of starting ROS 2",
     )
     parser.add_argument(
         "--test-output",
@@ -371,13 +360,12 @@ def _run_offline_test(engine_path, image_path, output_path):
     image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"Unable to read test image: {image_path}")
-    image = cv2.resize(image, (320, 320), interpolation=cv2.INTER_CUBIC)
-    model_input, original_shape, padded_shape = _prepare_image(image)
+    model_input, _ = _prepare_image(image)
     engine = TensorRTEngine(engine_path)
     depth = np.asarray(engine.infer(model_input), dtype=np.float32).squeeze()
-    if depth.shape != padded_shape:
-        raise ValueError(f"Unexpected output shape {depth.shape}; expected {padded_shape}")
-    depth = depth[: original_shape[0], : original_shape[1]]
+    expected_shape = (INPUT_HEIGHT, INPUT_WIDTH)
+    if depth.shape != expected_shape:
+        raise ValueError(f"Unexpected output shape {depth.shape}; expected {expected_shape}")
     finite = depth[np.isfinite(depth)]
     if not finite.size:
         raise RuntimeError("TensorRT output contains no finite values")

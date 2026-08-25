@@ -106,7 +106,7 @@ encoding: 32FC1
 ## Save One ROS Image
 
 Automatically decode a common color, grayscale, integer-depth, or float image
-topic and save both raw NPY data and a displayable JPG:
+topic and save raw NPY data plus two displayable JPG files:
 
 ```bash
 python3 Depth-Anything-V2/da_v2_ros2_node/save_ros_image.py \
@@ -115,3 +115,8 @@ python3 Depth-Anything-V2/da_v2_ros2_node/save_ros_image.py \
 
 The output directory defaults to the directory containing the script. Select
 another directory with `--out-dir /tmp`.
+
+Scalar images produce `<name>_fixed_1_50.jpg` using a fixed 1–50 TURBO scale
+with a colorbar, and `<name>_normalized.jpg` using per-frame min/max scaling.
+Each snapshot is stored in its own `<topic_name>_<timestamp>/` directory along
+with the raw `.npy` file.

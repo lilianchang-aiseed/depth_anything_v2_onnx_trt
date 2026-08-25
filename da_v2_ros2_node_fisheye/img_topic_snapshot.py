@@ -3,7 +3,7 @@
 
 Example:
     python3 img_topic_snapshot.py \
-        --img-topic /stereo_0_3/left/relative_depth
+        --img-topic /camera_0/relative_depth
 
 The output directory defaults to the directory containing this script.
 """
