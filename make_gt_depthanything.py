@@ -46,11 +46,11 @@ TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
 #   cam1.T_cn_cnm1 = T_{L<-I}  (maps a point in infra1 -> stereo-left)
 # --------------------------------------------------------------------------- #
 CAM0_PROJ = np.array([391.1833053665675, 391.2023258821923,
-                      315.333377935706, 240.48835472327764])          # infra1 fx fy cx cy
+                      315.333377935706, 240.48835472327764])            # infra1 fx fy cx cy
 CAM1_PROJ = np.array([167.07658738687104, 158.31284216746292,
-                      138.2772130077489, 156.41669349148265])          # left  fx fy cx cy
+                      138.2772130077489, 156.41669349148265])           # left  fx fy cx cy
 CAM1_DIST = np.array([-0.032352588466769784, -0.0244944119435387,
-                      -0.011755132756719569, -0.018714907886535945])   # left  k1 k2 p1 p2
+                      -0.011755132756719569, -0.018714907886535945])    # left  k1 k2 p1 p2
 
 T_LI = np.array([
     [0.9877923929746802, -0.03442690680274639, 0.15192424582453154, -0.021341394350870197],
@@ -220,6 +220,68 @@ def load_deploy_mask(path, out_hw):
 # Sky segmentation (NCNN)  -- filters sky out of the affine fit and exports a
 # sky mask so train_sml_global.py can label sky as a fixed far depth.
 # =========================================================================== #
+def _bias(x, b=0.8):
+    """Bias curve from the paper (eq. 2), as in mask_refine.cpp::bias()."""
+    return x / (((1.0 / b) - 2.0) * (1.0 - x) + 1.0)
+
+
+def probability_to_confidence(prob, low=0.3, high=0.5, bias_b=0.8, eps=0.01):
+    """
+    Port of mask_refine.cpp::probability_to_confidence.
+
+    Hysteresis on the raw sky probability -> a per-pixel CONFIDENCE weight:
+      * prob < low   -> confident NON-sky, weight = bias((low-p)/low)
+      * prob > high  -> confident sky,     weight = bias((p-high)/(1-high))
+      * in between    -> eps (distrust the fuzzy boundary)
+    """
+    conf = np.full_like(prob, eps, dtype=np.float32)
+    lo = prob < low
+    hi = prob > high
+    conf[lo] = np.maximum(_bias((low - prob[lo]) / low, bias_b), eps)
+    conf[hi] = np.maximum(_bias((prob[hi] - high) / (1.0 - high), bias_b), eps)
+    return conf
+
+
+def refine_sky_prob(prob, gray, radius=24, eps=1e-3, low=0.3, high=0.5,
+                    bias_b=0.8, do_bilateral=True):
+    """
+    Confidence-weighted guided-filter refinement of a sky probability map.
+
+    This is the compact equivalent of mask_refine.cpp: that file fits a local
+    affine RGB->mask model, weighted by the hysteresis confidence, solved at low
+    resolution (the LDL solve) and upsampled -- which is exactly a *guided
+    filter with a confidence weight*. Because the stereo-left image is grayscale
+    (an RGB guide with 3 identical channels makes the 3x3 covariance singular),
+    the scalar guided-filter form is used: stable and identical in effect.
+
+    Effect: the mask boundary snaps to the actual image edge (the horizon /
+    skyline), and the fuzzy CNN boundary is cleaned up. Larger `radius` => longer
+    range snapping; `eps` controls edge sharpness.
+    """
+    p = prob.astype(np.float32)
+    I = gray.astype(np.float32)
+    if I.max() > 1.5:
+        I = I / 255.0
+    w = probability_to_confidence(p, low, high, bias_b)                 # confidence weight
+    ksz = (2 * radius + 1, 2 * radius + 1)
+    box = lambda a: cv2.boxFilter(a, -1, ksz, normalize=False,
+                                  borderType=cv2.BORDER_REPLICATE)
+    W = box(w) + 1e-8
+    mean_I  = box(w * I) / W
+    mean_p  = box(w * p) / W
+    mean_II = box(w * I * I) / W
+    mean_Ip = box(w * I * p) / W
+    var_I  = mean_II - mean_I * mean_I
+    cov_Ip = mean_Ip - mean_I * mean_p
+    a = cov_Ip / (var_I + eps)                                          # local slope
+    b = mean_p - a * mean_I                                             # local offset
+    q = box(w * a) / W * I + box(w * b) / W                            # apply affine
+    q = np.clip(q, 0.0, 1.0)
+    if do_bilateral:                                                    # final smoothing (C++ does too)
+        q = cv2.bilateralFilter(q.astype(np.float32), 0, 0.08, 8)
+    return q
+
+
 class SkySegmenter:
     """
     Thin wrapper around an NCNN sky-segmentation model (e.g. the EGE-UNet model
@@ -239,7 +301,10 @@ class SkySegmenter:
     """
     def __init__(self, param, bin, size=320, input_name="in0", output_name="out0",
                  mean=(123.675, 116.28, 103.53), norm=(0.01712, 0.01751, 0.01743),
-                 sigmoid=True, thresh=0.5, invert=False, use_gpu=False):
+                 sigmoid=True, thresh=0.5, invert=False, use_gpu=False,
+                 refine=False, refine_radius=24, refine_eps=1e-3,
+                 refine_low=0.3, refine_high=0.5, refine_bias=0.8,
+                 refine_bilateral=True):
         import ncnn
         self.ncnn = ncnn
         self.net = ncnn.Net()
@@ -254,6 +319,13 @@ class SkySegmenter:
         self.sigmoid = sigmoid
         self.thresh = float(thresh)
         self.invert = invert
+        self.refine = bool(refine)
+        self.refine_radius = int(refine_radius)
+        self.refine_eps = float(refine_eps)
+        self.refine_low = float(refine_low)
+        self.refine_high = float(refine_high)
+        self.refine_bias = float(refine_bias)
+        self.refine_bilateral = bool(refine_bilateral)
 
     def prob(self, bgr):
         """Return HxW float sky probability at the input image resolution."""
@@ -278,7 +350,14 @@ class SkySegmenter:
         return 1.0 - p if self.invert else p
 
     def mask(self, bgr):
-        return self.prob(bgr) > self.thresh
+        p = self.prob(bgr)
+        if self.refine:
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+            p = refine_sky_prob(p, gray, radius=self.refine_radius,
+                                eps=self.refine_eps, low=self.refine_low,
+                                high=self.refine_high, bias_b=self.refine_bias,
+                                do_bilateral=self.refine_bilateral)
+        return p > self.thresh
 
 
 def heuristic_sky_mask(left_img, disk):
@@ -558,6 +637,29 @@ def build_montage(left_img, da_L, depth_I, rs_depth_L, anchor_valid, depth_L, in
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def fit_is_suspect(depth_L, gt_valid, info, min_spread, min_s, min_inl):
+    """
+    Flag a collapsed / poorly-fit frame: one where almost all pixels map to a
+    similar depth (affine slope ~0), or the fit had few inliers.
+
+    Returns (suspect: bool, reasons: list[str]).
+    """
+    reasons = []
+    d = depth_L[gt_valid & np.isfinite(depth_L)]
+    if d.size < 50:
+        return True, ["too_few_valid"]
+    p10, p90 = np.percentile(d, [10, 90])
+    spread = p90 / max(p10, 1e-6)                 # ~1.0 => all pixels same depth
+    if spread < min_spread:
+        reasons.append(f"spread={spread:.2f}<{min_spread}")
+    if info.get("mode") == "affine":
+        if abs(info.get("s", 0.0)) < min_s:
+            reasons.append(f"s={info.get('s',0):.4f}<{min_s}")
+        if info.get("inl", 1.0) < min_inl:
+            reasons.append(f"inl={info.get('inl',0):.2f}<{min_inl}")
+    return (len(reasons) > 0), reasons
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bag", required=True)
@@ -571,8 +673,8 @@ def main():
     ap.add_argument("--sync-tol", type=float, default=0.03)
     ap.add_argument("--max-pairs", type=int, default=1000)
     ap.add_argument("--dmin", type=float, default=0.2)
-    ap.add_argument("--dmax", type=float, default=25.0)
-    ap.add_argument("--max-fit-depth", type=float, default=10.0)
+    ap.add_argument("--dmax", type=float, default=30.0)
+    ap.add_argument("--max-fit-depth", type=float, default=30.0)
     ap.add_argument("--no-splat", action="store_true",
                     help="disable 2x2 splat (leave sub-pixel holes in the warp)")
     ap.add_argument("--tile", type=int, default=300)
@@ -592,6 +694,21 @@ def main():
     ap.add_argument("--sky-heuristic", action="store_true",
                     help="use the brightness/texture heuristic instead of NCNN")
     ap.add_argument("--sky-gpu", action="store_true")
+    # ---- sky mask refinement (guided-filter port of mask_refine.cpp) ----
+    ap.add_argument("--sky-refine", action="store_true",
+                    help="snap the sky mask to image edges via confidence-weighted "
+                         "guided filtering (port of mask_refine.cpp)")
+    ap.add_argument("--sky-refine-radius", type=int, default=24,
+                    help="guided-filter radius; larger = longer-range edge snapping")
+    ap.add_argument("--sky-refine-eps", type=float, default=1e-3,
+                    help="guided-filter regularization; smaller = sharper edges")
+    ap.add_argument("--sky-refine-low", type=float, default=0.3,
+                    help="hysteresis low threshold (confident non-sky below this)")
+    ap.add_argument("--sky-refine-high", type=float, default=0.5,
+                    help="hysteresis high threshold (confident sky above this)")
+    ap.add_argument("--sky-refine-bias", type=float, default=0.8)
+    ap.add_argument("--sky-refine-no-bilateral", action="store_true",
+                    help="skip the final bilateral filter")
     ap.add_argument("--depth-time-offset", type=float, default=0.0,
                     help="seconds subtracted from the disp time when matching D455 depth")
     ap.add_argument("--gt-max-depth", type=float, default=20.0,
@@ -620,6 +737,17 @@ def main():
                     help="override D435 Depth->Color rotation (row-major 3x3)")
     ap.add_argument("--d435-d2c-t", type=float, nargs=3, default=None,
                     help="override D435 Depth->Color translation")
+    # ---- inline QC: route collapsed/poor fits to a review subfolder ----
+    ap.add_argument("--no-qc", action="store_true",
+                    help="disable the inline collapsed-fit gate")
+    ap.add_argument("--qc-subdir", default="_review",
+                    help="subfolder under vis/export for flagged samples")
+    ap.add_argument("--qc-min-spread", type=float, default=1.5,
+                    help="flag if p90/p10 GT-depth ratio below this (near-constant depth)")
+    ap.add_argument("--qc-min-s", type=float, default=0.005,
+                    help="flag if |affine slope| below this (fit collapsed to s~0)")
+    ap.add_argument("--qc-min-inl", type=float, default=0.3,
+                    help="flag if fit inlier fraction below this")
     args = ap.parse_args()
 
     device = "cuda"
@@ -632,6 +760,17 @@ def main():
     os.makedirs(args.vis_dir, exist_ok=True)
     if args.export_dir:
         os.makedirs(args.export_dir, exist_ok=True)
+
+    qc_on = not args.no_qc
+    review_vis = os.path.join(args.vis_dir, args.qc_subdir)
+    review_export = os.path.join(args.export_dir, args.qc_subdir) if args.export_dir else None
+    if qc_on:
+        os.makedirs(review_vis, exist_ok=True)
+        if review_export:
+            os.makedirs(review_export, exist_ok=True)
+        print(f"  QC gate ON: collapsed fits -> {args.qc_subdir}/ "
+              f"(min_spread={args.qc_min_spread} min_s={args.qc_min_s} "
+              f"min_inl={args.qc_min_inl})")
 
     topics = [TOPIC_DEPTH, TOPIC_DEPTH_INFO, TOPIC_LEFT, TOPIC_DISP]
     if args.d435_depth:
@@ -679,8 +818,13 @@ def main():
             input_name=args.sky_input_name, output_name=args.sky_output_name,
             mean=tuple(args.sky_mean), norm=tuple(args.sky_norm),
             sigmoid=not args.sky_no_sigmoid, thresh=args.sky_thresh,
-            invert=args.sky_invert, use_gpu=args.sky_gpu)
-        print(f"  sky: NCNN model {args.sky_param}")
+            invert=args.sky_invert, use_gpu=args.sky_gpu,
+            refine=args.sky_refine, refine_radius=args.sky_refine_radius,
+            refine_eps=args.sky_refine_eps, refine_low=args.sky_refine_low,
+            refine_high=args.sky_refine_high, refine_bias=args.sky_refine_bias,
+            refine_bilateral=not args.sky_refine_no_bilateral)
+        print(f"  sky: NCNN model {args.sky_param}"
+              + ("  + refine (guided filter)" if args.sky_refine else ""))
     else:
         print("  sky: DISABLED (no --sky-param/--sky-bin, no --sky-heuristic)")
 
@@ -721,6 +865,7 @@ def main():
               f"dist={'color radtan' if d435_src_dist is not None else 'none (pinhole)'}")
 
     n = 0
+    n_suspect = 0
     for t_anchor, disp_msg in data[TOPIC_DISP]:
         if n >= args.max_pairs:
             break
@@ -763,19 +908,28 @@ def main():
 
         fov = deploy_mask if deploy_mask is not None else disp_valid_L
 
+        # SKY region-of-interest: the fisheye DISK (image content), NOT `fov`.
+        # `fov` for anchors is disp_valid_L when no --deploy-mask is given, but
+        # sky has near-zero disparity -> `& fov` here would erase ~all sky.
+        # Use the deploy mask if we have one (it IS the disk); otherwise infer
+        # the disk from left-image brightness (>8 = has image content).
+        if deploy_mask is not None:
+            sky_fov = deploy_mask
+        else:
+            g8 = left if left.ndim == 2 else cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+            sky_fov = g8 > 8
+
         # ---- SKY: segment, then EXCLUDE from the fit anchors ----
         left_bgr = left if left.ndim == 3 else cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
         if sky_seg is not None:
-            sky_mask = sky_seg.mask(left_bgr) & fov
+            sky_mask = sky_seg.mask(left_bgr) & sky_fov
         elif args.sky_heuristic:
-            sky_mask = heuristic_sky_mask(left, fov)
+            sky_mask = heuristic_sky_mask(left, sky_fov)
         else:
             sky_mask = np.zeros(out_hw, dtype=bool)
 
         anchor_valid = (np.isfinite(rs_depth_L) & (rs_depth_L > args.dmin)
                         & (rs_depth_L < args.max_fit_depth) & fov & ~sky_mask)
-        # anchor_valid = (np.isfinite(rs_depth_L) & (rs_depth_L > args.dmin)
-        #                 & (rs_depth_L < args.max_fit_depth) & disp_valid_L & ~sky_mask)
         if anchor_valid.sum() < 50:
             continue
         # ---- STEP 3 ----
@@ -791,24 +945,37 @@ def main():
         gt_valid = fov & np.isfinite(depth_L) & (depth_L > 0) & disp_valid_L & ~sky_mask
         gt_final = np.where(gt_valid, depth_L, np.nan).astype(np.float32)
 
+        # ---- QC: is this a collapsed / poor fit? ----
+        suspect, reasons = (False, [])
+        if qc_on:
+            suspect, reasons = fit_is_suspect(
+                depth_L, gt_valid, info,
+                args.qc_min_spread, args.qc_min_s, args.qc_min_inl)
+        vis_dir = review_vis if (qc_on and suspect) else args.vis_dir
+        exp_dir = (review_export if (qc_on and suspect) else args.export_dir)
+
         # ---- STEP 6 (viz) ----
         montage = build_montage(left, da_L, depth_I, rs_depth_L, anchor_valid,
                                 depth_L, info, fov, gt_valid, disp_L,
                                 args.tile, args.dmin, args.dmax, sky_mask=sky_mask)
-        cv2.imwrite(os.path.join(args.vis_dir, f"gt_{n:04d}.png"), montage)
+        cv2.imwrite(os.path.join(vis_dir, f"gt_{n:04d}.png"), montage)
 
         # ---- STEP 5 (export) ----
-        if args.export_dir:
+        if exp_dir:
             np.savez_compressed(
-                os.path.join(args.export_dir, f"sample_{n:04d}.npz"),
+                os.path.join(exp_dir, f"sample_{n:04d}.npz"),
                 disp=disp.astype(np.float32),
                 depth_aligned=gt_final,
                 left=left,
                 valid_mask=gt_valid.astype(np.bool_),
-                sky_mask=(sky_mask & fov).astype(np.bool_),
+                sky_mask=(sky_mask & sky_fov).astype(np.bool_),
                 has_disp=np.bool_(True),
                 stamp=np.float64(t_anchor),
             )
+
+        if suspect:
+            n_suspect += 1
+            print(f"  [review] frame {n} -> {args.qc_subdir}/  ({', '.join(reasons)})")
 
         if n % 20 == 0:
             fitmsg = (f"s={info['s']:.2f} inl={info['inl']*100:.0f}%"
@@ -823,6 +990,11 @@ def main():
 
     print(f"done. {n} frames -> {args.vis_dir}"
           + (f" and {args.export_dir}" if args.export_dir else ""))
+    if qc_on:
+        kept = n - n_suspect
+        print(f"QC: {kept} kept, {n_suspect} flagged to {args.qc_subdir}/ "
+              f"({100*n_suspect/max(n,1):.0f}%). Review the montages there and move "
+              f"any good ones back up a level.")
 
 
 if __name__ == "__main__":

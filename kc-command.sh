@@ -1,0 +1,16 @@
+python make_gt_depthanything.py  \
+ --bag /home/share/bags/nx-2.0/0825/train_1_0-5 \
+ --vis-dir /home/share/bags/nx-2.0/0825/train_1_0-5-v \
+ --export-dir /home/share/bags/nx-2.0/0825/train_1_0-5-d \
+ --max-pairs 5000 \
+ --da-model depth-anything/Depth-Anything-V2-Small-hf \
+ --sky-param /home/kc/Projects/depth/Depth-Anything-V2/EGE_165.ncnn.param \
+ --sky-bin /home/kc/Projects/depth/Depth-Anything-V2/EGE_165.ncnn.bin \
+ --sky-input-name in0 --sky-output-name out0 --sky-size 384 --sky-no-sigmoid \
+ --sky-refine \
+ --d435-depth /d435/d435_node/depth/image_rect_raw \    
+ --d435-source infra1 \
+ --d435-info /d435/d435_node/depth/camera_info \
+ --d435-depth-scale 0.001 --d435-merge fill \
+ --sync-tol 0.05 \
+ --max-fit-depth 30.0
