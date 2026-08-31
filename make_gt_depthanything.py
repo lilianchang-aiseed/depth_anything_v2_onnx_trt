@@ -232,6 +232,34 @@ def calib_extract_d435_color_to_d455_color(calib):
     return K, dist, T_C455_C435
 
 
+def calib_extract_left_to_d455_infra1(calib):
+    """
+    From a left <-> D455-infra1 camchain, return
+      (K_left, dist_left, T_{L <- I455}).
+    Handles either ordering:
+       cam0=stereo left, cam1=D455 infra1  -> T_1_0 = T_{I455 <- L}, invert
+       cam0=D455 infra1, cam1=stereo left  -> T_1_0 = T_{L <- I455}
+    'left' is detected by a '/stereo_' + '/left' topic.
+    """
+    def is_left(cam):
+        return "stereo" in cam["topic"] and "left" in cam["topic"]
+    def is_i455(cam):
+        return "d455" in cam["topic"] and "infra1" in cam["topic"]
+    c0, c1, T10 = calib["cam0"], calib["cam1"], calib["T_1_0"]
+    if is_left(c0) and is_i455(c1):
+        K, dist = c0["K"], c0["dist"]
+        T_I455_L = T10                              # cam0->cam1 = L->I455
+        T_L_I455 = np.linalg.inv(T_I455_L)
+    elif is_i455(c0) and is_left(c1):
+        K, dist = c1["K"], c1["dist"]
+        T_L_I455 = T10                              # cam0->cam1 = I455->L
+    else:
+        raise ValueError(
+            f"expected a stereo-left <-> D455-infra1 calibration; got "
+            f"cam0={c0.get('topic')} cam1={c1.get('topic')}")
+    return K, dist, T_L_I455
+
+
 # --------------------------------------------------------------------------- #
 # IO helpers
 # --------------------------------------------------------------------------- #
@@ -742,6 +770,7 @@ def fit_is_suspect(depth_L, gt_valid, info, min_spread, min_s, min_inl):
 
 
 def main():
+    global T_LI, CAM1_PROJ, CAM1_DIST
     ap = argparse.ArgumentParser()
     ap.add_argument("--bag", required=True)
     ap.add_argument("--vis-dir", default="./gt_vis")
@@ -754,8 +783,8 @@ def main():
     ap.add_argument("--sync-tol", type=float, default=0.03)
     ap.add_argument("--max-pairs", type=int, default=1000)
     ap.add_argument("--dmin", type=float, default=0.2)
-    ap.add_argument("--dmax", type=float, default=20.0)
-    ap.add_argument("--max-fit-depth", type=float, default=30.0)
+    ap.add_argument("--dmax", type=float, default=15.0)
+    ap.add_argument("--max-fit-depth", type=float, default=10.0)
     ap.add_argument("--no-splat", action="store_true",
                     help="disable 2x2 splat (leave sub-pixel holes in the warp)")
     ap.add_argument("--tile", type=int, default=300)
@@ -830,6 +859,11 @@ def main():
                     help="D455 infra1 depth topic (default: %(default)s)")
     ap.add_argument("--d455-info", default=TOPIC_DEPTH_INFO,
                     help="D455 depth camera_info topic (default: %(default)s)")
+    # ---- fresh rig geometry from calibration files (recommended) ----
+    ap.add_argument("--left-calib", default=None,
+                    help="Kalibr camchain .txt for stereo-left <-> D455-infra1. "
+                         "Overrides the hardcoded T_LI, CAM1_PROJ and CAM1_DIST with "
+                         "the fresh values -- USE THIS whenever the rig was recalibrated.")
     # ---- inline QC: route collapsed/poor fits to a review subfolder ----
     ap.add_argument("--no-qc", action="store_true",
                     help="disable the inline collapsed-fit gate")
@@ -842,6 +876,17 @@ def main():
     ap.add_argument("--qc-min-inl", type=float, default=0.3,
                     help="flag if fit inlier fraction below this")
     args = ap.parse_args()
+
+    # Fresh rig geometry: override T_LI / left intrinsics from --left-calib.
+    if args.left_calib:
+        _lc = parse_kalibr_camchain_txt(args.left_calib)
+        K_left, dist_left, T_L_I455_new = calib_extract_left_to_d455_infra1(_lc)
+        T_LI = T_L_I455_new
+        CAM1_PROJ = np.array(K_left)
+        CAM1_DIST = np.array(dist_left)
+        print(f"[left-calib] {os.path.basename(args.left_calib)}: "
+              f"T_L<-I455 t={np.round(T_LI[:3,3],4)}  "
+              f"left K={tuple(round(v,2) for v in K_left)}")
 
     device = "cuda"
     try:
