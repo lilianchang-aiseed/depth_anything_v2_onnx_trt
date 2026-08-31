@@ -46,11 +46,11 @@ TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
 #   cam1.T_cn_cnm1 = T_{L<-I}  (maps a point in infra1 -> stereo-left)
 # --------------------------------------------------------------------------- #
 CAM0_PROJ = np.array([391.1833053665675, 391.2023258821923,
-                      315.333377935706, 240.48835472327764])            # infra1 fx fy cx cy
+                      315.333377935706, 240.48835472327764])          # infra1 fx fy cx cy
 CAM1_PROJ = np.array([167.07658738687104, 158.31284216746292,
-                      138.2772130077489, 156.41669349148265])           # left  fx fy cx cy
+                      138.2772130077489, 156.41669349148265])          # left  fx fy cx cy
 CAM1_DIST = np.array([-0.032352588466769784, -0.0244944119435387,
-                      -0.011755132756719569, -0.018714907886535945])    # left  k1 k2 p1 p2
+                      -0.011755132756719569, -0.018714907886535945])   # left  k1 k2 p1 p2
 
 T_LI = np.array([
     [0.9877923929746802, -0.03442690680274639, 0.15192424582453154, -0.021341394350870197],
@@ -59,12 +59,8 @@ T_LI = np.array([
     [0.0, 0.0, 0.0, 1.0],
 ])  # T_{L<-I}   (I = D455 infra1/depth)
 
-# TOPIC_DEPTH = "/camera/camera/depth/image_rect_raw"          # depth in infra1 frame
-# TOPIC_DEPTH_INFO = "/camera/camera/depth/camera_info"
-
-TOPIC_DEPTH = "/d455/d455_node/depth/image_rect_raw"
+TOPIC_DEPTH = "/d455/d455_node/depth/image_rect_raw"          # depth in infra1 frame
 TOPIC_DEPTH_INFO = "/d455/d455_node/depth/camera_info"
-
 TOPIC_LEFT = "/stereo_1_0/left/image_rect"
 TOPIC_DISP = "/stereo_1_0/disparity"
 
@@ -149,6 +145,91 @@ def compose_T_L_from_D435infra1(T_c455_i455, T_c435_i435):
     the color-aligned resampling + color-lens distortion.
     """
     return compose_T_L_from_D435color(T_c455_i455) @ T_c435_i435
+
+
+# --------------------------------------------------------------------------- #
+# Parse a Kalibr camchain result .txt (the human-readable one produced by
+# kalibr_calibrate_cameras). Handles either camera ordering and returns the
+# per-cam intrinsics + the T_1_0 baseline as a 4x4.
+# --------------------------------------------------------------------------- #
+def parse_kalibr_camchain_txt(path):
+    """
+    Return dict:
+      cam0: {topic, K=(fx,fy,cx,cy), dist=(k1,k2,p1,p2)}
+      cam1: same
+      T_1_0: 4x4  (Kalibr: point in cam0 frame -> cam1 frame)
+    """
+    import re
+    lines = open(path).read().splitlines()
+    out = {"cam0": {}, "cam1": {}, "T_1_0": None}
+    cur = None
+    q = t = None
+    for ln in lines:
+        s = ln.strip()
+        m = re.match(r"^cam([01])\s*\(([^)]+)\):", s)
+        if m:
+            cur = f"cam{m.group(1)}"
+            out[cur]["topic"] = m.group(2)
+            continue
+        if cur and s.startswith("distortion:"):
+            vals = [float(x) for x in re.findall(r"-?\d+\.\d+(?:[eE][-+]?\d+)?", s)]
+            out[cur]["dist"] = tuple(vals[:4])
+        elif cur and s.startswith("projection:"):
+            vals = [float(x) for x in re.findall(r"-?\d+\.\d+(?:[eE][-+]?\d+)?", s)]
+            out[cur]["K"] = tuple(vals[:4])
+        elif s.startswith("q:"):
+            vals = [float(x) for x in re.findall(r"-?\d+\.\d+(?:[eE][-+]?\d+)?", s)]
+            q = np.array(vals[:4])
+        elif s.startswith("t:"):
+            vals = [float(x) for x in re.findall(r"-?\d+\.\d+(?:[eE][-+]?\d+)?", s)]
+            t = np.array(vals[:3])
+    if q is None or t is None:
+        raise ValueError(f"couldn't parse T_1_0 (q/t) from {path}")
+    out["T_1_0"] = make_T(quat_xyzw_to_R(q), t)
+    return out
+
+
+def calib_extract_d435_infra1_to_d455_infra1(calib):
+    """
+    From a parsed camchain, return (K_d435_infra1, dist_d435_infra1,
+    T_{I455 <- I435}). Handles either ordering:
+       cam0=D435 infra1, cam1=D455 infra1   -> T_1_0 = T_{I455 <- I435}
+       cam0=D455 infra1, cam1=D435 infra1   -> T_1_0 = T_{I435 <- I455}, invert
+    Refuses color topics (those go through the older 4-hop chain).
+    """
+    def is_d(cam, prefix, kind):
+        return prefix in cam["topic"] and kind in cam["topic"]
+    c0, c1, T10 = calib["cam0"], calib["cam1"], calib["T_1_0"]
+    if is_d(c0, "d435", "infra1") and is_d(c1, "d455", "infra1"):
+        K, dist = c0["K"], c0["dist"]
+        T_I455_I435 = T10                           # cam0->cam1 = D435->D455
+    elif is_d(c0, "d455", "infra1") and is_d(c1, "d435", "infra1"):
+        K, dist = c1["K"], c1["dist"]
+        T_I435_I455 = T10                           # cam0->cam1 = D455->D435
+        T_I455_I435 = np.linalg.inv(T_I435_I455)
+    else:
+        raise ValueError(
+            f"expected an infra1<->infra1 D455/D435 calibration; got "
+            f"cam0={c0.get('topic')} cam1={c1.get('topic')}")
+    return K, dist, T_I455_I435
+
+
+def calib_extract_d435_color_to_d455_color(calib):
+    """As above but for the OLDER color<->color calibration."""
+    def is_d(cam, prefix, kind):
+        return prefix in cam["topic"] and kind in cam["topic"]
+    c0, c1, T10 = calib["cam0"], calib["cam1"], calib["T_1_0"]
+    if is_d(c0, "d435", "color") and is_d(c1, "d455", "color"):
+        K, dist = c0["K"], c0["dist"]
+        T_C455_C435 = T10                           # cam0->cam1 = D435->D455
+    elif is_d(c0, "d455", "color") and is_d(c1, "d435", "color"):
+        K, dist = c1["K"], c1["dist"]
+        T_C455_C435 = np.linalg.inv(T10)
+    else:
+        raise ValueError(
+            f"expected a color<->color D455/D435 calibration; got "
+            f"cam0={c0.get('topic')} cam1={c1.get('topic')}")
+    return K, dist, T_C455_C435
 
 
 # --------------------------------------------------------------------------- #
@@ -673,7 +754,7 @@ def main():
     ap.add_argument("--sync-tol", type=float, default=0.03)
     ap.add_argument("--max-pairs", type=int, default=1000)
     ap.add_argument("--dmin", type=float, default=0.2)
-    ap.add_argument("--dmax", type=float, default=30.0)
+    ap.add_argument("--dmax", type=float, default=20.0)
     ap.add_argument("--max-fit-depth", type=float, default=30.0)
     ap.add_argument("--no-splat", action="store_true",
                     help="disable 2x2 splat (leave sub-pixel holes in the warp)")
@@ -717,9 +798,16 @@ def main():
     ap.add_argument("--d435-depth", default=None,
                     help="D435 depth topic; enables the 2nd warp. Pair with "
                          "--d435-source to say which frame it's in.")
-    ap.add_argument("--d435-source", choices=["color", "infra1"], default="color",
-                    help="color: topic is aligned_depth_to_color (D435 color frame); "
-                         "infra1: topic is raw depth/image_rect_raw (D435 infra1 frame)")
+    ap.add_argument("--d435-source", choices=["color", "infra1", "kalibr_infra1"], default="color",
+                    help="color: topic is aligned_depth_to_color (D435 color frame, 4-hop chain); "
+                         "infra1: topic is raw depth/image_rect_raw with factory D435 D2C extrinsic (3-hop); "
+                         "kalibr_infra1: raw depth + a direct D455-infra1 <-> D435-infra1 Kalibr "
+                         "calibration (--d435-calib), 2-hop, cleanest -- USE THIS when you have "
+                         "the newer infra1<->infra1 calibration.")
+    ap.add_argument("--d435-calib", default=None,
+                    help="path to a Kalibr camchain .txt. For --d435-source kalibr_infra1 it must be "
+                         "the D455-infra1 <-> D435-infra1 calibration; for --d435-source color it may "
+                         "be the D455-color <-> D435-color one (overrides the hardcoded T_C455_C435).")
     ap.add_argument("--d435-proj", type=float, nargs=4, default=None,
                     help="D435 intrinsics fx fy cx cy for the chosen source "
                          "(default: color=Kalibr color K; infra1=read from its camera_info)")
@@ -737,6 +825,11 @@ def main():
                     help="override D435 Depth->Color rotation (row-major 3x3)")
     ap.add_argument("--d435-d2c-t", type=float, nargs=3, default=None,
                     help="override D435 Depth->Color translation")
+    # ---- D455 topic overrides (bags differ; the code no longer hardcodes these) ----
+    ap.add_argument("--d455-depth", default=TOPIC_DEPTH,
+                    help="D455 infra1 depth topic (default: %(default)s)")
+    ap.add_argument("--d455-info", default=TOPIC_DEPTH_INFO,
+                    help="D455 depth camera_info topic (default: %(default)s)")
     # ---- inline QC: route collapsed/poor fits to a review subfolder ----
     ap.add_argument("--no-qc", action="store_true",
                     help="disable the inline collapsed-fit gate")
@@ -772,7 +865,7 @@ def main():
               f"(min_spread={args.qc_min_spread} min_s={args.qc_min_s} "
               f"min_inl={args.qc_min_inl})")
 
-    topics = [TOPIC_DEPTH, TOPIC_DEPTH_INFO, TOPIC_LEFT, TOPIC_DISP]
+    topics = [args.d455_depth, args.d455_info, TOPIC_LEFT, TOPIC_DISP]
     if args.d435_depth:
         topics.append(args.d435_depth)
     if args.d435_info:
@@ -781,10 +874,17 @@ def main():
     data = load_topics(args.bag, topics)
     for t in topics:
         print(f"  {t}: {len(data[t])}")
+    # fail fast on required topics (silent 0-frame runs are hard to diagnose)
+    for req in (args.d455_depth, TOPIC_LEFT, TOPIC_DISP):
+        if len(data.get(req, [])) == 0:
+            raise SystemExit(
+                f"ERROR: required topic '{req}' has 0 messages in this bag.\n"
+                f"       Check `ros2 bag info {args.bag}` for the actual topic name\n"
+                f"       and pass it via --d455-depth / --d455-info if it differs.")
 
     # infra1 intrinsics for back-projection: prefer depth/camera_info, else Kalibr cam0
-    if data[TOPIC_DEPTH_INFO]:
-        k = np.array(data[TOPIC_DEPTH_INFO][0][1].k).reshape(3, 3)
+    if data[args.d455_info]:
+        k = np.array(data[args.d455_info][0][1].k).reshape(3, 3)
         K_I = (k[0, 0], k[1, 1], k[0, 2], k[1, 2])
         rel = np.abs(np.array(K_I) - CAM0_PROJ) / CAM0_PROJ
         print(f"  depth camera_info K_I = {tuple(round(v,2) for v in K_I)}")
@@ -833,19 +933,45 @@ def main():
     if args.d435_depth and not d435_enabled:
         print(f"  D435: topic {args.d435_depth} has no messages; DISABLED")
     if d435_enabled:
-        T_c455_i455 = (make_T(np.array(args.d455_d2c_R).reshape(3, 3), np.array(args.d455_d2c_t))
-                       if args.d455_d2c_R is not None and args.d455_d2c_t is not None
-                       else make_T(D455_D2C_R, D455_D2C_t))
+        # optional parsed calib (overrides for --d435-source color, required for kalibr_infra1)
+        parsed = parse_kalibr_camchain_txt(args.d435_calib) if args.d435_calib else None
 
-        if args.d435_source == "color":
-            T_L_D435 = compose_T_L_from_D435color(T_c455_i455)
-            d435_src_dist = D435_COLOR_DIST                    # color lens distortion
-            if args.d435_proj is not None:
-                K_d435 = tuple(args.d435_proj)
+        if args.d435_source == "kalibr_infra1":
+            if parsed is None:
+                raise SystemExit("--d435-source kalibr_infra1 requires --d435-calib "
+                                 "(a D455-infra1 <-> D435-infra1 Kalibr .txt)")
+            K_from_calib, dist_from_calib, T_I455_I435 = \
+                calib_extract_d435_infra1_to_d455_infra1(parsed)
+            # cleanest chain: L <- I455 <- I435  (only 2 hops)
+            T_L_D435 = T_LI @ T_I455_I435
+            d435_src_dist = dist_from_calib                  # non-zero radtan from calib
+            K_d435 = tuple(args.d435_proj) if args.d435_proj is not None else K_from_calib
+
+        elif args.d435_source == "color":
+            T_c455_i455 = (make_T(np.array(args.d455_d2c_R).reshape(3, 3),
+                                  np.array(args.d455_d2c_t))
+                           if args.d455_d2c_R is not None and args.d455_d2c_t is not None
+                           else make_T(D455_D2C_R, D455_D2C_t))
+            # if a color<->color calib was provided, use it in place of the hardcoded T_C455_C435
+            if parsed is not None:
+                K_from_calib, dist_from_calib, T_C455_C435_ovr = \
+                    calib_extract_d435_color_to_d455_color(parsed)
+                T_L_c455 = T_LI @ np.linalg.inv(T_c455_i455)
+                T_L_D435 = T_L_c455 @ T_C455_C435_ovr
+                d435_src_dist = dist_from_calib
+                K_d435 = tuple(args.d435_proj) if args.d435_proj is not None else K_from_calib
             else:
-                K_d435 = tuple(D435_COLOR_PROJ)
-        else:  # infra1 (raw depth) -- cleaner, matches the D455 path
-            T_c435_i435 = (make_T(np.array(args.d435_d2c_R).reshape(3, 3), np.array(args.d435_d2c_t))
+                T_L_D435 = compose_T_L_from_D435color(T_c455_i455)
+                d435_src_dist = D435_COLOR_DIST
+                K_d435 = tuple(args.d435_proj) if args.d435_proj is not None else tuple(D435_COLOR_PROJ)
+
+        else:  # infra1 (raw depth), factory D435 D2C extrinsic (3-hop legacy)
+            T_c455_i455 = (make_T(np.array(args.d455_d2c_R).reshape(3, 3),
+                                  np.array(args.d455_d2c_t))
+                           if args.d455_d2c_R is not None and args.d455_d2c_t is not None
+                           else make_T(D455_D2C_R, D455_D2C_t))
+            T_c435_i435 = (make_T(np.array(args.d435_d2c_R).reshape(3, 3),
+                                  np.array(args.d435_d2c_t))
                            if args.d435_d2c_R is not None and args.d435_d2c_t is not None
                            else make_T(D435_D2C_R, D435_D2C_t))
             T_L_D435 = compose_T_L_from_D435infra1(T_c455_i455, T_c435_i435)
@@ -858,18 +984,20 @@ def main():
             else:
                 raise SystemExit("--d435-source infra1 needs --d435-proj or --d435-info "
                                  "(the D435 infra1 intrinsics differ from its color K)")
+
         print(f"  D435: enabled  source={args.d435_source}  topic={args.d435_depth}  "
-              f"merge={args.d435_merge}")
-        print(f"        K_d435={tuple(round(v,1) for v in K_d435)}  "
+              f"merge={args.d435_merge}"
+              + (f"  calib={os.path.basename(args.d435_calib)}" if args.d435_calib else ""))
+        print(f"        K_d435={tuple(round(v,2) for v in K_d435)}  "
               f"T_L<-D435 t={np.round(T_L_D435[:3,3],4)}  "
-              f"dist={'color radtan' if d435_src_dist is not None else 'none (pinhole)'}")
+              f"dist={'radtan (from calib/factory)' if d435_src_dist is not None else 'none (pinhole)'}")
 
     n = 0
     n_suspect = 0
     for t_anchor, disp_msg in data[TOPIC_DISP]:
         if n >= args.max_pairs:
             break
-        dm = nearest(data[TOPIC_DEPTH], t_anchor - args.depth_time_offset, args.sync_tol)
+        dm = nearest(data[args.d455_depth], t_anchor - args.depth_time_offset, args.sync_tol)
         lm = nearest(data[TOPIC_LEFT], t_anchor, args.sync_tol)
         if dm is None or lm is None:
             continue
