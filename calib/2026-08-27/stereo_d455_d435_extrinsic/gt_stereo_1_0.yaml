@@ -1,0 +1,49 @@
+# Combined GT-generation config for the 2026-08-27 rig.
+# Matrix convention: T_target_from_source maps source-frame 3D points into target.
+sources:
+  target_to_cube_imu: ../rect_4cam_imu_in-extinsic/cam2imu/flight_data_2026_08_04-18_11_04_1-camchain-imucam.yaml
+  d455_depth_to_cube_imu: ../rect_4cam_imu_in-extinsic/cam2realsense2imu/rs_d455_cube-imu_calib/flight_data_2026_08_27-10_27_07_0-camchain-imucam.yaml
+  d455_depth_to_d435_depth: ../rs_2cam_in-extrinsic/flight_data_2026_08_27-10_27_07_0-camchain.yaml
+
+topics:
+  left: /stereo_1_0/left/image_rect
+  disparity: /stereo_1_0/disparity
+  d455_depth: /d455/d455_node/depth/image_rect_raw
+  d455_camera_info: /d455/d455_node/depth/camera_info
+
+target:
+  intrinsics: [157.90718294969474, 150.82613798877807, 137.2392017892296, 162.09926651723032]
+  distortion: [-0.03144610780506922, -0.009209428514045158, 0.00809137604018658, -0.024315044913275994]
+
+d455:
+  intrinsics: [411.75046101221477, 406.6683176274347, 289.2686675707598, 209.61441876821763]
+
+transforms:
+  # T_stereo1_0_left<-D455_depth, composed through the shared Cube IMU.
+  target_from_d455_depth:
+    - [0.9915649222082056, -0.046027012168254784, 0.12116319241874186, -0.024932379138607175]
+    - [0.05112843521829649, 0.9979171302266304, -0.03933553498272824, 0.013038851775035613]
+    - [-0.11910032812031296, 0.04519862111959059, 0.9918529107133398, -0.014120993901878556]
+    - [0.0, 0.0, 0.0, 1.0]
+  # Direct Kalibr T_D435depth<-D455depth.
+  d435_depth_from_d455_depth:
+    - [0.9977874435047719, 0.006856618065229324, -0.06613020771872238, -0.061219490856716345]
+    - [-0.028036512738727905, 0.9452950354703613, -0.3250096150401424, -0.08852231722164512]
+    - [0.060284090253274504, 0.3261445733164941, 0.943395752459454, -0.023948287617004543]
+    - [0.0, 0.0, 0.0, 1.0]
+
+d435:
+  depth_topic: /d435/d435_node/depth/image_rect_raw
+  camera_info_topic: /d435/d435_node/depth/camera_info
+  source: infra1
+  intrinsics: [387.5594962560567, 391.56181694047507, 328.04048246531534, 234.38905393665516]
+  depth_scale: 0.001
+  time_offset: 0.0
+  merge: fill
+
+runtime:
+  depth_scale: 0.001
+  sync_tol: 0.05
+  depth_time_offset: 0.0
+
+deploy_mask: ../../../sml/masks/pair_1_0_circle_fov.npy
