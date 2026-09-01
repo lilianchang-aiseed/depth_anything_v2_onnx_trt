@@ -185,7 +185,13 @@ def parse_kalibr_camchain_txt(path):
             t = np.array(vals[:3])
     if q is None or t is None:
         raise ValueError(f"couldn't parse T_1_0 (q/t) from {path}")
-    out["T_1_0"] = make_T(quat_xyzw_to_R(q), t)
+    # aslam_cv (Kalibr's backend) serializes rotations in the JPL quaternion
+    # convention, whose rotation matrix is the TRANSPOSE of the Hamilton one that
+    # quat_xyzw_to_R computes. Without this transpose the rotation is inverted
+    # relative to the translation -- harmless for small-angle pairs but it flips
+    # large-angle ones (e.g. a 19 deg-tilted D435) so the ground warps into the
+    # sky. Transpose here so all downstream T_1_0 inversions are correct.
+    out["T_1_0"] = make_T(quat_xyzw_to_R(q).T, t)
     return out
 
 
@@ -864,6 +870,10 @@ def main():
                     help="Kalibr camchain .txt for stereo-left <-> D455-infra1. "
                          "Overrides the hardcoded T_LI, CAM1_PROJ and CAM1_DIST with "
                          "the fresh values -- USE THIS whenever the rig was recalibrated.")
+    ap.add_argument("--allow-calib-mismatch", action="store_true",
+                    help="(deprecated, no-op) the D455-infra1 intrinsics consistency "
+                         "check has been removed; this flag is accepted for backward "
+                         "compatibility but does nothing")
     # ---- inline QC: route collapsed/poor fits to a review subfolder ----
     ap.add_argument("--no-qc", action="store_true",
                     help="disable the inline collapsed-fit gate")
@@ -1039,12 +1049,20 @@ def main():
 
     n = 0
     n_suspect = 0
+    n_skipped_sync = 0
+    n_skipped_anchors = 0
+    n_skipped_fit = 0
     for t_anchor, disp_msg in data[TOPIC_DISP]:
         if n >= args.max_pairs:
             break
         dm = nearest(data[args.d455_depth], t_anchor - args.depth_time_offset, args.sync_tol)
         lm = nearest(data[TOPIC_LEFT], t_anchor, args.sync_tol)
         if dm is None or lm is None:
+            if n_skipped_sync < 5:
+                print(f"  [skip @ disp t={t_anchor:.3f}] "
+                      f"depth={'MISS' if dm is None else 'ok'} "
+                      f"left={'MISS' if lm is None else 'ok'}")
+            n_skipped_sync += 1
             continue
 
         depth_I = image_to_numpy(dm[1]).astype(np.float32) * args.depth_scale   # infra1 frame
@@ -1104,11 +1122,21 @@ def main():
         anchor_valid = (np.isfinite(rs_depth_L) & (rs_depth_L > args.dmin)
                         & (rs_depth_L < args.max_fit_depth) & fov & ~sky_mask)
         if anchor_valid.sum() < 50:
+            if n_skipped_anchors < 5:
+                print(f"  [skip @ disp t={t_anchor:.3f}] anchors={int(anchor_valid.sum())}<50  "
+                      f"rs_cover={np.isfinite(rs_depth_L).mean()*100:.0f}% "
+                      f"fov={fov.mean()*100:.0f}% sky={sky_mask.mean()*100:.0f}% "
+                      f"rs_in_range={((np.isfinite(rs_depth_L))&(rs_depth_L>args.dmin)&(rs_depth_L<args.max_fit_depth)).mean()*100:.0f}%")
+            n_skipped_anchors += 1
             continue
         # ---- STEP 3 ----
         depth_L, info = step3_fit_metric_L(da_L, rs_depth_L, anchor_valid,
                                            args.da_metric, max_depth=args.gt_max_depth)
         if depth_L is None:
+            if n_skipped_fit < 5:
+                print(f"  [skip @ disp t={t_anchor:.3f}] fit returned None "
+                      f"(anchors={int(anchor_valid.sum())})")
+            n_skipped_fit += 1
             continue
         depth_L[sky_mask] = np.nan        # sky has no valid metric depth (viz + safety)
         # ---- STEP 4 ----
@@ -1163,6 +1191,13 @@ def main():
 
     print(f"done. {n} frames -> {args.vis_dir}"
           + (f" and {args.export_dir}" if args.export_dir else ""))
+    total_disp = len(data[TOPIC_DISP])
+    seen = min(total_disp, args.max_pairs)
+    print(f"SKIP SUMMARY (of {seen} disparity frames processed):")
+    print(f"  sync-miss     : {n_skipped_sync}  (loosen --sync-tol or check --depth-time-offset)")
+    print(f"  <50 anchors   : {n_skipped_anchors}  (RS depth doesn't overlap the FOV, or too little in-range)")
+    print(f"  fit failed    : {n_skipped_fit}")
+    print(f"  kept          : {n}")
     if qc_on:
         kept = n - n_suspect
         print(f"QC: {kept} kept, {n_suspect} flagged to {args.qc_subdir}/ "
