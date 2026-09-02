@@ -12,6 +12,12 @@ python3 transform/dynamo.py export \
   --width 0 \
   --output checkpoints/depth_anything_v2_vits_dynamic.onnx
 
+metric VKITTI (raw output is depth in metres, maximum 80 m):
+python3 transform/dynamo.py export \
+  --encoder vits \
+  --metric outdoor \
+  --output checkpoints/depth_anything_v2_metric_vkitti_vits.onnx
+
 inference: 
 python3 transform/dynamo.py infer \
     checkpoints/depth_anything_v2_vits_dynamic.onnx \
@@ -35,10 +41,25 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from depth_anything_v2.config import Encoder, Metric
-from depth_anything_v2.dpt import DepthAnythingV2
+from depth_anything_v2.dpt import DepthAnythingV2 as RelativeDepthAnythingV2
+from metric_depth.depth_anything_v2.dpt import (
+    DepthAnythingV2 as MetricDepthAnythingV2,
+)
 
 
-LOCAL_CHECKPOINT = PROJECT_DIR / "checkpoints" / "depth_anything_v2_vits.pth"
+LOCAL_CHECKPOINTS = {
+    None: PROJECT_DIR / "checkpoints" / "depth_anything_v2_vits.pth",
+    Metric.indoor: (
+        PROJECT_DIR
+        / "checkpoints"
+        / "depth_anything_v2_metric_hypersim_vits.pth"
+    ),
+    Metric.outdoor: (
+        PROJECT_DIR
+        / "checkpoints"
+        / "depth_anything_v2_metric_vkitti_vits.pth"
+    ),
+}
 
 
 class ExportFormat(StrEnum):
@@ -133,15 +154,16 @@ def export(
             "Only the local vits checkpoint is available; use --encoder vits.",
             param_hint="--encoder",
         )
-    if metric is not None:
+    if metric is not None and (height == 0 or width == 0):
         raise typer.BadParameter(
-            "The local checkpoint is the relative-depth model and does not "
-            "support --metric.",
-            param_hint="--metric",
+            "Metric export requires static --height and --width with the "
+            "legacy tracer; use the 518x518 defaults.",
+            param_hint="--height/--width",
         )
-    if not LOCAL_CHECKPOINT.is_file():
+    checkpoint = LOCAL_CHECKPOINTS[metric]
+    if not checkpoint.is_file():
         raise FileNotFoundError(
-            f"Local checkpoint not found: {LOCAL_CHECKPOINT}"
+            f"Local checkpoint not found: {checkpoint}"
         )
 
     if torch.__version__ < "2.3":
@@ -159,13 +181,19 @@ def export(
     output.parent.mkdir(parents=True, exist_ok=True)
 
     config = encoder.get_config(metric)
-    model = DepthAnythingV2(
-        encoder=encoder.value,
-        features=config.features,
-        out_channels=config.out_channels,
-    )
-    typer.echo(f"Loading local checkpoint: {LOCAL_CHECKPOINT}")
-    state_dict = torch.load(LOCAL_CHECKPOINT, map_location="cpu")
+    model_args = {
+        "encoder": encoder.value,
+        "features": config.features,
+        "out_channels": config.out_channels,
+    }
+    if metric is None:
+        model = RelativeDepthAnythingV2(**model_args)
+    else:
+        max_depth = 20.0 if metric == Metric.indoor else 80.0
+        model = MetricDepthAnythingV2(**model_args, max_depth=max_depth)
+        typer.echo(f"Metric model: {metric.value}, max_depth={max_depth:g} m")
+    typer.echo(f"Loading local checkpoint: {checkpoint}")
+    state_dict = torch.load(checkpoint, map_location="cpu")
     model.load_state_dict(state_dict)
     model.eval()
 

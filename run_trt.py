@@ -5,6 +5,20 @@ import cv2
 import glob
 import os
 from utils import DPTTrt, preprocess, postprocess
+from frame_mask_utils import parse_bool, prepare_frame
+
+
+def apply_valid_mask(image, valid_mask):
+    if valid_mask is None:
+        return image
+    if valid_mask.shape != image.shape[:2]:
+        valid_mask = cv2.resize(
+            valid_mask.astype("uint8"),
+            (image.shape[1], image.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+    image[~valid_mask] = 0
+    return image
 
 
 def process_video(session, args, filenames):
@@ -32,12 +46,17 @@ def process_video(session, args, filenames):
             if not ret:
                 break
 
-            image = preprocess(raw_frame, args.input_size)
+            valid_mask = None
+            inference_frame = raw_frame
+            if args.frame_mask:
+                inference_frame, valid_mask = prepare_frame(raw_frame)
+            image = preprocess(inference_frame, args.input_size)
             depth = session.inference(image)
 
             depth = postprocess(
                 (frame_width, frame_height), depth, args.grayscale, args.crop_region
             )
+            depth = apply_valid_mask(depth, valid_mask)
 
             if args.crop_region is not None:
                 raw_frame_copy = raw_frame.copy()
@@ -57,7 +76,14 @@ def process_images(session, args, filenames):
         print(f"Processing {k+1}/{len(filenames)}: {filename}")
 
         raw_image = cv2.imread(filename)
-        image = preprocess(raw_image, args.input_size)
+        if raw_image is None:
+            print(f"Skip unreadable image: {filename}")
+            continue
+        valid_mask = None
+        inference_image = raw_image
+        if args.frame_mask:
+            inference_image, valid_mask = prepare_frame(raw_image)
+        image = preprocess(inference_image, args.input_size)
         depth = session.inference(image)
 
         depth = postprocess(
@@ -66,6 +92,7 @@ def process_images(session, args, filenames):
             args.grayscale,
             args.crop_region,
         )
+        depth = apply_valid_mask(depth, valid_mask)
 
         if args.crop_region is not None:
             raw_image_copy = raw_image.copy()
@@ -153,6 +180,13 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Get value x,y,w,h with space i.e. 0 0 500 500",
+    )
+    parser.add_argument(
+        "--frame-mask",
+        type=parse_bool,
+        default=False,
+        metavar="{True,False}",
+        help="Fill the black outer frame before inference and mask it afterward.",
     )
     args = parser.parse_args()
     main(args)

@@ -1,0 +1,73 @@
+# GT generation defaults. Paths are resolved relative to this YAML file.
+# Raw Kalibr outputs remain under ./calib and are never copied into this file.
+
+io:
+  bag: null
+  vis_dir: ./gt_vis
+  export_dir: null
+  max_pairs: 1000
+  tile: 300
+
+topics:
+  left: /stereo_1_0/left/image_rect
+  disparity: /stereo_1_0/disparity
+  d455_depth: /d455/d455_node/depth/image_rect_raw
+  d455_camera_info: /d455/d455_node/depth/camera_info
+  d435_depth: /d435/d435_node/depth/image_rect_raw
+  d435_camera_info: /d435/d435_node/depth/camera_info
+
+calibration:
+  # Unmodified outputs copied directly from Kalibr.
+  left_d455: ../calib/2026-08-27/stereo_d455_d435_extrinsic/d455-left/stereo_1_0_d455_composed-camchain.yaml
+  d455_d435: ../calib/2026-08-27/stereo_d455_d435_extrinsic/d455-d435/flight_data_2026_08_27-10_27_07_0-camchain.yaml
+  d455_depth_scale: 0.001
+  d435_depth_scale: 0.001
+  d435_source: kalibr_infra1
+
+mask:
+  # null uses the whole target image. Set a .npy circle mask when available.
+  deploy_mask: ../masks/pair_1_0_circle_fov.npy
+
+runtime:
+  sync_tol: 0.05
+  depth_time_offset: 0.0
+  d435_time_offset: 0.0
+  dmin: 0.2
+  dmax: 15.0
+  max_fit_depth: 30.0
+  gt_max_depth: 20.0
+  splat: true
+  d435_merge: fill
+
+da:
+  model: depth-anything/Depth-Anything-V2-Small-hf
+  metric: false
+
+sky:
+  enabled: true
+  param: ../EGE_165.ncnn.param
+  bin: ../EGE_165.ncnn.bin
+  size: 384
+  input_name: in0
+  output_name: out0
+  mean: [123.675, 116.28, 103.53]
+  norm: [0.01712, 0.01751, 0.01743]
+  apply_sigmoid: false
+  threshold: 0.5
+  invert: false
+  heuristic: false
+  gpu: false
+  refine: true
+  refine_radius: 24
+  refine_eps: 0.001
+  refine_low: 0.3
+  refine_high: 0.5
+  refine_bias: 0.8
+  refine_bilateral: true
+
+qc:
+  enabled: true
+  subdir: _review
+  min_spread: 1.5
+  min_scale: 0.005
+  min_inlier_ratio: 0.3
