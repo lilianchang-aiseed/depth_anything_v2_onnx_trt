@@ -1,0 +1,8 @@
+cam0:
+  cam_overlaps: []
+  camera_model: ds
+  distortion_coeffs: []
+  distortion_model: none
+  intrinsics: [-0.004861271648180069, 0.4447198769543506, 300.7560132072761, 301.90540252255073, 639.8317750586917, 479.4278563475575]
+  resolution: [1230, 924]
+  rostopic: /camera_3/image_throttled

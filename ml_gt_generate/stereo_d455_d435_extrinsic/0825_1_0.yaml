@@ -1,0 +1,57 @@
+# Combined GT-generation config for the 2026-08-25 rig.
+# Matrix convention: T_target_from_source maps source-frame 3D points into target.
+sources:
+  target_intrinsics: ../rect_4cam_imu_in-extinsic/cam2imu/flight_data_2026_08_04-18_11_04_1-camchain-imucam.yaml
+  target_to_cube_imu: ../rect_4cam_imu_in-extinsic/cam2imu/flight_data_2026_08_04-18_11_04_1-camchain-imucam.yaml
+  d455_color_to_cube_imu: ../rect_4cam_imu_in-extinsic/cam2realsense2imu/flight_data_2026_08_17-20_04_11_1-camchain-imucam.yaml
+  d435_color_to_d455_color: ../rs_2cam_in-extrinsic/flight_data_2026_08_25-14_17_16_0-camchain.yaml
+source_notes:
+  realsense_depth_to_color: factory values recorded in sml/make_gt_depthanything.py
+quality_note: >-
+  The 2026-08-25 D455-color/IMU calibration was previously marked potentially
+  degenerate. Prefer the 2026-08-27 or direct 2026-08-28 calibration when its
+  physical mounting matches the dataset.
+
+topics:
+  left: /stereo_1_0/left/image_rect
+  disparity: /stereo_1_0/disparity
+  d455_depth: /d455/d455_node/depth/image_rect_raw
+  d455_camera_info: /d455/d455_node/depth/camera_info
+
+target:
+  intrinsics: [157.90718294969474, 150.82613798877807, 137.2392017892296, 162.09926651723032]
+  distortion: [-0.03144610780506922, -0.009209428514045158, 0.00809137604018658, -0.024315044913275994]
+
+d455:
+  intrinsics: [391.392333984375, 391.392333984375, 320.7922668457031, 241.19110107421875]
+
+transforms:
+  # T_stereo1_0_left<-D455_depth, composed through the shared Cube IMU and
+  # the D455 factory depth-to-color transform.
+  target_from_d455_depth:
+    - [0.9869444801590084, -0.027131401986653713, 0.15875902282266363, -0.028505823625523768]
+    - [0.029108009733076708, 0.9995248566569643, -0.010137881846325955, 0.013986259048614886]
+    - [-0.15840852790075877, 0.014626685990336927, 0.9872653311959554, -0.0971749320291606]
+    - [0.0, 0.0, 0.0, 1.0]
+  # T_D435depth<-D455depth, composed from color-to-color plus factory D2C.
+  d435_depth_from_d455_depth:
+    - [0.9982238840795405, 0.03573496285572167, -0.04766564881139673, -0.04763713906666135]
+    - [-0.03438159350222632, 0.9989903488396579, 0.028917123399660873, -0.07002085220810252]
+    - [0.04865087415624422, -0.02722694262940904, 0.9984447196326657, 0.016987097099427154]
+    - [0.0, 0.0, 0.0, 1.0]
+
+d435:
+  depth_topic: /d435/d435_node/depth/image_rect_raw
+  camera_info_topic: /d435/d435_node/depth/camera_info
+  source: infra1
+  intrinsics: [385.5057067871094, 385.5057067871094, 324.6714172363281, 231.95643615722656]
+  depth_scale: 0.001
+  time_offset: 0.0
+  merge: fill
+
+runtime:
+  depth_scale: 0.001
+  sync_tol: 0.05
+  depth_time_offset: 0.0
+
+deploy_mask: ../../../sml/masks/pair_1_0_circle_fov.npy

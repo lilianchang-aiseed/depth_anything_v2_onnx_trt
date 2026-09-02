@@ -1,0 +1,115 @@
+^Cnvidia@yuan-6n0cnx:~$ ros2 topic echo /d455/d455_node/depth/camera_info --once
+header:
+  stamp:
+    sec: 1787742312
+    nanosec: 623020264
+  frame_id: camera_depth_optical_frame
+height: 480
+width: 640
+distortion_model: plumb_bob
+d:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+k:
+- 391.392333984375
+- 0.0
+- 320.7922668457031
+- 0.0
+- 391.392333984375
+- 241.19110107421875
+- 0.0
+- 0.0
+- 1.0
+r:
+- 1.0
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+p:
+- 391.392333984375
+- 0.0
+- 320.7922668457031
+- 0.0
+- 0.0
+- 391.392333984375
+- 241.19110107421875
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+- 0.0
+binning_x: 0
+binning_y: 0
+roi:
+  x_offset: 0
+  y_offset: 0
+  height: 0
+  width: 0
+  do_rectify: false
+---
+^[[Anvidia@yuan-6n0cnx:~$ ros2 topic echo /d455/d455_node/depth/camera_info --oncnvinvidia@yuan-6n0cnx:~$ nvidia@yuan-6n0cnx:~$ ros2 topic echo /d435/d435_node/depth/camera_info --once
+header:
+  stamp:
+    sec: 1787742332
+    nanosec: 301233887
+  frame_id: camera_depth_optical_frame
+height: 480
+width: 640
+distortion_model: plumb_bob
+d:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+k:
+- 385.5057067871094
+- 0.0
+- 324.6714172363281
+- 0.0
+- 385.5057067871094
+- 231.95643615722656
+- 0.0
+- 0.0
+- 1.0
+r:
+- 1.0
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+p:
+- 385.5057067871094
+- 0.0
+- 324.6714172363281
+- 0.0
+- 0.0
+- 385.5057067871094
+- 231.95643615722656
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+- 0.0
+binning_x: 0
+binning_y: 0
+roi:
+  x_offset: 0
+  y_offset: 0
+  height: 0
+  width: 0
+  do_rectify: false
+---
+nvidia@yuan-6n0cnx:~$ 

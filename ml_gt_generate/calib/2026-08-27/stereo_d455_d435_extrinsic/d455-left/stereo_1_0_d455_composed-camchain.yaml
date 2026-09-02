@@ -1,0 +1,25 @@
+# Kalibr-compatible two-camera chain for the 2026-08-27 rig.
+# This is not a direct two-camera Kalibr estimate. T_cn_cnm1 was obtained by
+# composing the stereo-left and D455-infra1 calibrations through the shared
+# Cube IMU, then inverting T_Left<-D455 to obtain T_D455<-Left.
+cam0:
+  cam_overlaps: [1]
+  camera_model: pinhole
+  distortion_coeffs: [-0.03144610780506922, -0.009209428514045158, 0.00809137604018658, -0.024315044913275994]
+  distortion_model: radtan
+  intrinsics: [157.90718294969474, 150.82613798877807, 137.2392017892296, 162.09926651723032]
+  resolution: [320, 320]
+  rostopic: /stereo_1_0/left/image_rect
+cam1:
+  T_cn_cnm1:
+  - [0.9915649222082031, 0.0511284352182964, -0.1191003281203126, 0.0223736014856389]
+  - [-0.0460270121682546, 0.9979171302266276, 0.0451986211195905, -0.0135210070095871]
+  - [0.1211631924187416, -0.0393355349827281, 0.9918529107133369, 0.0175397257649031]
+  - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: [0]
+  camera_model: pinhole
+  distortion_coeffs: [0.011271099689313236, 0.001388004643421515, -0.015119164107067987, -0.017282641639372237]
+  distortion_model: radtan
+  intrinsics: [411.75046101221477, 406.6683176274347, 289.2686675707598, 209.61441876821763]
+  resolution: [640, 480]
+  rostopic: /d455/d455_node/infra1/image_rect_raw

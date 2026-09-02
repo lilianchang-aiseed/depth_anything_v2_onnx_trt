@@ -1,0 +1,19 @@
+%YAML:1.0
+
+# OpenVINS camera-IMU chain generated from
+# flight_data_2026_08_04-18_11_04_1-camchain-imucam.yaml.
+# This calibration contains cam0 only, so OpenVINS must run in mono mode.
+cam0:
+  T_cam_imu:
+    - [0.061645131257844626, -0.9961143236691757, 0.06289778989203293, 0.0006161749037754733]
+    - [0.03958396232530903, -0.06052811354847887, -0.9973812999033467, -0.00046105120074768673]
+    - [0.9973128835620397, 0.06397344489209295, 0.035698888355335745, -2.0723444634855646e-07]
+    - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.03244175845474721, -0.011430444884891186, 0.010768262133809157, -0.024675241344505598]
+  distortion_model: radtan
+  intrinsics: [163.19620135256736, 155.3890609374247, 130.03377014752047, 159.9470617581387]
+  resolution: [320, 320]
+  rostopic: /stereo_1_0/left/image_rect
+  timeshift_cam_imu: -0.16108667605408186

@@ -1,0 +1,74 @@
+# TEMPORARY ONLY
+# D435i example extrinsic from the official realsense-ros README.
+# This is not the factory calibration of the locally attached RealSense.
+#
+# Source:
+# https://github.com/realsenseai/realsense-ros/blob/ros2-master/README.md#extrinsics-from-sensor-a-to-sensor-b
+#
+# The README publishes depth_to_color and states that depth and infra1
+# coordinates converge. It is therefore used here as infra1_to_color.
+#
+# HOW TO GET THE CORRECT VALUES FOR YOUR OWN REALSENSE
+# -----------------------------------------------------
+# Preferred method while the ROS2 RealSense driver is running:
+#
+#   ros2 topic list | grep extrinsics
+#   ros2 topic echo --once /camera/camera/extrinsics/depth_to_color
+#
+# Copy the nine values under `rotation` into `rotation` below and the three
+# values under `translation` into `translation_m`. Translation is in metres.
+# The ROS Extrinsics message stores the 3x3 rotation in COLUMN-MAJOR order.
+# If the returned rotation array is [r0, r1, ..., r8], construct the matrix as:
+#
+#   R = [[r0, r3, r6],
+#        [r1, r4, r7],
+#        [r2, r5, r8]]
+#
+# Then rebuild `T_color_infra1` as:
+#
+#   [[R00, R01, R02, translation_m[0]],
+#    [R10, R11, R12, translation_m[1]],
+#    [R20, R21, R22, translation_m[2]],
+#    [0,   0,   0,   1]]
+#
+# If the extrinsics topic is unavailable, read the calibration stored in the
+# connected camera with librealsense and locate the Depth-to-Color extrinsic:
+#
+#   rs-enumerate-devices -c
+#
+# The optical frames can also be inspected through TF. Confirm the exact frame
+# names from each camera_info message before using tf2_echo:
+#
+#   ros2 topic echo --once /camera/camera/color/camera_info
+#   ros2 topic echo --once /camera/camera/infra1/camera_info
+#   ros2 run tf2_ros tf2_echo camera_infra1_optical_frame camera_color_optical_frame
+#
+# Frame direction matters: this file expects T_color_infra1, which maps a point
+# expressed in the infra1 optical frame into the color optical frame. Do not
+# copy a color-to-infra1 matrix here without inverting it first.
+
+source_frame: camera_infra1_optical_frame
+target_frame: camera_color_optical_frame
+transform_convention: "T_color_infra1 (maps infra1 coordinates into color coordinates)"
+rotation_storage: column-major
+rotation:
+  - 0.9999583959579468
+  - 0.008895332925021648
+  - -0.0020127370953559875
+  - -0.008895229548215866
+  - 0.9999604225158691
+  - 0.00006045500049367547
+  - 0.0020131953060626984
+  - -0.000042548726923658
+  - 0.9999979734420776
+translation_m:
+  - 0.01485931035131216
+  - 0.0010161789832636714
+  - 0.0005317096947692335
+
+# Homogeneous matrix form after converting the column-major rotation array.
+T_color_infra1:
+  - [0.9999583959579468, -0.008895229548215866, 0.0020131953060626984, 0.01485931035131216]
+  - [0.008895332925021648, 0.9999604225158691, -0.000042548726923658, 0.0010161789832636714]
+  - [-0.0020127370953559875, 0.00006045500049367547, 0.9999979734420776, 0.0005317096947692335]
+  - [0.0, 0.0, 0.0, 1.0]

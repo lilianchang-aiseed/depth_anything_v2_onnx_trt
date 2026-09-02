@@ -1,0 +1,26 @@
+# Kalibr-compatible D455-depth/D435-depth chain for the 2026-08-25 rig.
+# This is NOT a direct depth-camera Kalibr estimate. The transform was composed
+# from the direct D435-color/D455-color Kalibr calibration and both sensors'
+# recorded factory depth-to-color transforms. T_cn_cnm1 below is
+# T_D435depth<-D455depth.
+cam0:
+  cam_overlaps: [1]
+  camera_model: pinhole
+  distortion_coeffs: [0.0, 0.0, 0.0, 0.0]
+  distortion_model: radtan
+  intrinsics: [391.392333984375, 391.392333984375, 320.7922668457031, 241.19110107421875]
+  resolution: [640, 480]
+  rostopic: /d455/d455_node/infra1/image_rect_raw
+cam1:
+  T_cn_cnm1:
+  - [0.9982238840795405, 0.03573496285572167, -0.04766564881139673, -0.04763713906666135]
+  - [-0.03438159350222632, 0.9989903488396579, 0.028917123399660873, -0.07002085220810252]
+  - [0.04865087415624422, -0.02722694262940904, 0.9984447196326657, 0.016987097099427154]
+  - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: [0]
+  camera_model: pinhole
+  distortion_coeffs: [0.0, 0.0, 0.0, 0.0]
+  distortion_model: radtan
+  intrinsics: [385.5057067871094, 385.5057067871094, 324.6714172363281, 231.95643615722656]
+  resolution: [640, 480]
+  rostopic: /d435/d435_node/infra1/image_rect_raw

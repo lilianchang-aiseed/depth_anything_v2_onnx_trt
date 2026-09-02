@@ -1,0 +1,50 @@
+# Combined GT-generation config for the 2026-08-28 rig.
+# Both transforms below come from direct Kalibr camera-to-camera calibration.
+# Matrix convention: T_target_from_source maps source-frame 3D points into target.
+sources:
+  target_to_d455_depth: d455-left/flight_data_2026_08_31-12_42_27_0-camchain.yaml
+  d455_depth_to_d435_depth: d455-d435/flight_data_2026_08_31-12_28_13_0-camchain.yaml
+
+topics:
+  left: /stereo_2_1/left/image_rect
+  disparity: /stereo_2_1/disparity
+  d455_depth: /d455/d455_node/depth/image_rect_raw
+  d455_camera_info: /d455/d455_node/depth/camera_info
+
+target:
+  intrinsics: [163.83305833753104, 155.68061047173805, 158.28531721336515, 148.8140015801317]
+  distortion: [-0.10157987723023018, 0.033435329706853166, 0.01222179197031348, 0.034744697283978075]
+
+d455:
+  intrinsics: [384.62690833984516, 384.62040745433836, 317.2865402062391, 243.15092314968092]
+
+transforms:
+  # T_stereo2_1_left<-D455depth; inverse of d455-left cam1.T_cn_cnm1.
+  target_from_d455_depth:
+    - [0.9995226127326795, -0.013084950363593029, 0.027988045841349354, 0.04747329784152366]
+    - [0.009756207484829338, 0.9932098953573578, 0.11592635670862864, 0.04237465062755615]
+    - [-0.029314894704708157, -0.11559795775966611, 0.992863409090215, 0.03932589194135474]
+    - [0.0, 0.0, 0.0, 1.0]
+  # Direct Kalibr T_D435depth<-D455depth.
+  d435_depth_from_d455_depth:
+    - [0.9987314007553556, 0.04268879877651762, -0.026706845644240744, -0.03689307423949768]
+    - [-0.04480431515805026, 0.9954242917796743, -0.08439817935331252, -0.08123262185229242]
+    - [0.022981786015569397, 0.08548769381585743, 0.9960741396691226, -0.034931709065565246]
+    - [0.0, 0.0, 0.0, 1.0]
+
+d435:
+  depth_topic: /d435/d435_node/depth/image_rect_raw
+  camera_info_topic: /d435/d435_node/depth/camera_info
+  source: infra1
+  intrinsics: [381.68254136568595, 383.0558250901984, 325.1333207138509, 232.60708981374648]
+  depth_scale: 0.001
+  time_offset: 0.0
+  merge: fill
+
+runtime:
+  depth_scale: 0.001
+  sync_tol: 0.05
+  depth_time_offset: 0.0
+
+# Add a pair_2_1 mask here when available; null means the whole 320x320 image.
+deploy_mask: null

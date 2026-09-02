@@ -1,0 +1,122 @@
+Calibration results
+===================
+Normalized Residuals
+----------------------------
+Reprojection error (cam0):     mean 2.1459664999152115, median 1.5135842609854728, std: 2.029047909892085
+Reprojection error (cam1):     mean 2.2552968456496356, median 1.680939513380745, std: 2.146248276327054
+Gyroscope error (imu0):        mean 1.1420015122942646, median 0.7952115558780923, std: 1.5995312327376252
+Accelerometer error (imu0):    mean 2.669588421673703, median 1.9407645932690492, std: 3.6714133990019238
+
+Residuals
+----------------------------
+Reprojection error (cam0) [px]:     mean 2.1459664999152115, median 1.5135842609854728, std: 2.029047909892085
+Reprojection error (cam1) [px]:     mean 2.2552968456496356, median 1.680939513380745, std: 2.146248276327054
+Gyroscope error (imu0) [rad/s]:     mean 0.0006551005847488037, median 0.0004561671325707583, std: 0.000917559070289907
+Accelerometer error (imu0) [m/s^2]: mean 0.01891440756428274, median 0.01375058874446489, std: 0.026012477729489784
+
+Transformation (cam0):
+-----------------------
+T_ci:  (imu0 to cam0): 
+[[ 0.13633614 -0.99055455  0.01463361  0.02990328]
+ [ 0.034182   -0.01005909 -0.999365    0.01511571]
+ [ 0.99007275  0.13674978  0.03248771 -0.10593778]
+ [ 0.          0.          0.          1.        ]]
+
+T_ic:  (cam0 to imu0): 
+[[ 0.13633614  0.034182    0.99007275  0.10029253]
+ [-0.99055455 -0.01005909  0.13674978  0.04425985]
+ [ 0.01463361 -0.999365    0.03248771  0.01811019]
+ [ 0.          0.          0.          1.        ]]
+
+timeshift cam0 to imu0: [s] (t_imu = t_cam + shift)
+-0.14230599579312334
+
+
+Transformation (cam1):
+-----------------------
+T_ci:  (imu0 to cam1): 
+[[-0.04221275 -0.99872481  0.02769177 -0.03723357]
+ [ 0.03583804 -0.02921222 -0.99893057  0.01285847]
+ [ 0.99846568 -0.04117519  0.03702547 -0.1073803 ]
+ [ 0.          0.          0.          1.        ]]
+
+T_ic:  (cam1 to imu0): 
+[[-0.04221275  0.03583804  0.99846568  0.10518299]
+ [-0.99872481 -0.02921222 -0.04117519 -0.04123187]
+ [ 0.02769177 -0.99893057  0.03702547  0.01785159]
+ [ 0.          0.          0.          1.        ]]
+
+timeshift cam1 to imu0: [s] (t_imu = t_cam + shift)
+-0.1934082413626727
+
+Baselines:
+----------
+Baseline (cam0 to cam1): 
+[[ 0.98394151 -0.01907083 -0.17746945 -0.0851691 ]
+ [ 0.01920436  0.99981511 -0.00096547 -0.00293099]
+ [ 0.17745505 -0.00245822  0.98412584 -0.00839352]
+ [ 0.          0.          0.          1.        ]]
+baseline norm:  0.0856318717360083 [m]
+
+
+Gravity vector in target coords: [m/s^2]
+[-4.17205432 -0.06451686 -8.87458299]
+
+
+Calibration configuration
+=========================
+
+cam0
+-----
+  Camera model: pinhole
+  Focal length: [157.90718294969474, 150.82613798877807]
+  Principal point: [137.2392017892296, 162.09926651723032]
+  Distortion model: radtan
+  Distortion coefficients: [-0.03144610780506922, -0.009209428514045158, 0.00809137604018658, -0.024315044913275994]
+  Type: checkerboard
+  Rows
+    Count: 8
+    Distance: 0.02 [m]
+  Cols
+    Count: 11
+    Distance: 0.02 [m]
+
+cam1
+-----
+  Camera model: pinhole
+  Focal length: [153.68049730029296, 147.35324765779288]
+  Principal point: [174.0901722806695, 160.73563396517]
+  Distortion model: radtan
+  Distortion coefficients: [-0.07339047497350926, -0.0015845181685253686, 0.017515404728075147, 0.0032496851992207887]
+  Type: checkerboard
+  Rows
+    Count: 8
+    Distance: 0.02 [m]
+  Cols
+    Count: 11
+    Distance: 0.02 [m]
+
+
+
+IMU configuration
+=================
+
+IMU0:
+ ----------------------------
+  Model: calibrated
+  Update rate: 50.0
+  Accelerometer:
+    Noise density: 0.0010019901002151698 
+    Noise density (discrete): 0.007085139945439349 
+    Random walk: 1.9893785362909353e-05
+  Gyroscope:
+    Noise density: 8.112529814510266e-05
+    Noise density (discrete): 0.0005736424844418254 
+    Random walk: 6.28721982800146e-07
+  T_ib (imu0 to imu0)
+    [[1. 0. 0. 0.]
+     [0. 1. 0. 0.]
+     [0. 0. 1. 0.]
+     [0. 0. 0. 1.]]
+  time offset with respect to IMU0: 0.0 [s]
+

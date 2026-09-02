@@ -1,0 +1,61 @@
+# TEMPORARY RESULT — DO NOT USE AS A FINAL CALIBRATION.
+# The RealSense infra1-to-color component uses the example D435i extrinsic
+# from the official realsense-ros README, not this device's factory value.
+# The existing color-to-IMU calibration also estimated near-zero translation
+# and was previously identified as potentially degenerate.
+#
+# Convention: T_target_source maps points from source coordinates to target.
+# Composition used:
+#   T_imu_left  = inv(T_color_imu) * T_color_infra1 * inv(T_left_infra1)
+#   T_imu_right = T_imu_left * inv(T_right_left)
+
+inputs:
+  realsense_example: temporary_d435i_readme_infra1_to_color.yaml
+  infra1_to_left: calib_ir_20260814_192834-camchain-0.yaml
+  left_to_right: calib_ir_20260814_192834-camchain-01.yaml
+  imu_to_color: flight_data_2026_08_17-20_04_11_1-camchain-imucam.yaml
+
+left_camera_to_imu:
+  source_topic: /stereo_1_0/left/image_rect
+  target_topic: /mavros/imu/data_raw
+  convention: "T_imu_left (maps left-camera coordinates into IMU coordinates)"
+  matrix:
+    - [0.129186383391, 0.031445233936, 0.991121625837, 0.012333481140]
+    - [-0.991529223923, -0.009451082801, 0.129539364214, -0.034066749813]
+    - [0.013440568719, -0.999460779438, 0.029957918232, 0.052832213353]
+    - [0.0, 0.0, 0.0, 1.0]
+  translation_norm_m: 0.064061696571
+
+right_camera_to_imu:
+  source_topic: /stereo_1_0/right/image_rect
+  target_topic: /mavros/imu/data_raw
+  convention: "T_imu_right (maps right-camera coordinates into IMU coordinates)"
+  matrix:
+    - [-0.052644404214, 0.027004355063, 0.998248132032, 0.015909601215]
+    - [-0.998578507972, -0.009768854366, -0.052397563319, -0.114797323727]
+    - [0.008336778577, -0.999587569767, 0.027480245222, 0.051421437680]
+    - [0.0, 0.0, 0.0, 1.0]
+  translation_norm_m: 0.126790004333
+
+# Inverses are included for software expecting Kalibr-style T_cam_imu.
+imu_to_left_camera:
+  convention: "T_left_imu (maps IMU coordinates into left-camera coordinates)"
+  matrix:
+    - [0.129186382472, -0.991529251847, 0.013440568508, -0.036081591750]
+    - [0.031445234948, -0.009451083452, -0.999460804075, 0.052093929531]
+    - [0.991121624317, 0.129539368586, 0.029957917963, -0.009393737713]
+    - [0.0, 0.0, 0.0, 1.0]
+
+imu_to_right_camera:
+  convention: "T_right_imu (maps IMU coordinates into right-camera coordinates)"
+  matrix:
+    - [-0.052644404843, -0.998578536225, 0.008336778433, -0.114225281135]
+    - [0.027004356082, -0.009768855030, -0.999587594402, 0.049849164241]
+    - [0.998248130376, -0.052397564084, 0.027480244810, -0.023309903491]
+    - [0.0, 0.0, 0.0, 1.0]
+
+validation:
+  determinant_left_rotation: 0.999999974360
+  determinant_right_rotation: 0.999999974360
+  left_inverse_closure_error: 1.11e-16
+  right_inverse_closure_error: 1.10e-17

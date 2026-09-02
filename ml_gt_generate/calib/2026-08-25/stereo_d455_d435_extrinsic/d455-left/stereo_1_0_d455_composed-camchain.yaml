@@ -1,0 +1,27 @@
+# Kalibr-compatible two-camera chain for the 2026-08-25 rig.
+# This is NOT a direct two-camera Kalibr estimate. The transform was composed
+# from the stereo-left/Cube-IMU and D455-color/Cube-IMU calibrations plus the
+# recorded D455 factory depth-to-color transform. T_cn_cnm1 below is
+# T_D455depth<-stereo1_0_left.
+cam0:
+  cam_overlaps: [1]
+  camera_model: pinhole
+  distortion_coeffs: [-0.03144610780506922, -0.009209428514045158, 0.00809137604018658, -0.024315044913275994]
+  distortion_model: radtan
+  intrinsics: [157.90718294969474, 150.82613798877807, 137.2392017892296, 162.09926651723032]
+  resolution: [320, 320]
+  rostopic: /stereo_1_0/left/image_rect
+cam1:
+  T_cn_cnm1:
+  - [0.9869445345932687, 0.02910801130685807, -0.1584085365616312, 0.01233321587154732]
+  - [-0.02713140226930698, 0.9995248646625758, 0.01462668589304665, -0.01333166944303583]
+  - [0.15875901684527008, -0.01013788167927565, 0.9872652935092904, 0.10060478536403795]
+  - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: [0]
+  camera_model: pinhole
+  # depth/image_rect_raw is rectified and uses the Infra1/depth optical frame.
+  distortion_coeffs: [0.0, 0.0, 0.0, 0.0]
+  distortion_model: radtan
+  intrinsics: [391.392333984375, 391.392333984375, 320.7922668457031, 241.19110107421875]
+  resolution: [640, 480]
+  rostopic: /d455/d455_node/infra1/image_rect_raw
