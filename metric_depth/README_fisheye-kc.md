@@ -71,7 +71,19 @@ python train_fisheye.py \
     --min-depth 0.2 --max-depth 20 \
     --bs 4 --epochs 60 --lr 5e-6 --amp \
     --pretrained-from ../checkpoints/depth_anything_v2_vits.pth \
-    --save-path exp/fisheye_vits
+    --sky-as-far --save-path exp/fisheye_vits
+    
+# with separate validation set
+python train_fisheye.py \
+    --data /home/kc/Projects/depth/dataset/train_0825-0827-0901-0902 \
+    --val-data /home/kc/Projects/depth/dataset/valid_0825 \
+    --encoder vits --img-size 518 \ 
+    --min-depth 0.5 --max-depth 20 \
+    --bs 4 --epochs 200 --lr 5e-6 --amp \
+    --select-metric abs_rel \
+    --pretrained-from ../checkpoints/depth_anything_v2_vits.pth \
+    --save-path exp/fisheye_vits-0903_1 --sky-as-far \
+    2>&1 | tee exp/fisheye_vits-0903_1/log.txt
 ```
 
 Key flags:
