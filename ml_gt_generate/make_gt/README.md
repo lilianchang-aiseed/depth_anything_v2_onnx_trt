@@ -71,6 +71,19 @@ ten samples or reaches the end of the bag.
 `--frame-interval` reduces DA-V2 inference work, but the current implementation
 still loads all requested bag topics into memory before processing.
 
+### Isotonic-PCHIP clamp dataset
+
+`make_gt_depthanything_clamp.py` leaves the original generator unchanged. Its
+defaults are `--fit-mode isotonic-pchip --metric-depth-max 15 --far-depth 19
+--model-max-depth 20`. Exact depths through 15 m use `metric_valid_mask`;
+farther pixels, low relative-DA values beyond the fitted 15 m threshold, and
+sky use `far_mask`. The stored 19 m value means "farther than 15 m", not an
+exact 19 m measurement.
+
+Use the same command as above and replace the script filename. The clamp NPZ
+additionally stores `metric_valid_mask`, `far_mask`, `sky_mask`, `da_relative`,
+and the three depth thresholds.
+
 ## Required inputs
 
 ### 1. Python environment
@@ -84,6 +97,7 @@ The environment must provide:
 - `transformers`
 - `Pillow`
 - `PyYAML`
+- `natsort` (used by `postprocess_review.py`)
 - the Python `ncnn` binding when NCNN sky segmentation is enabled
 
 CUDA is used automatically when PyTorch reports that it is available.
@@ -315,6 +329,23 @@ Existing CSV, PNG, and NPZ files are never overwritten. A `.complete` marker
 is created only after one bag succeeds; completed bags are skipped on later
 runs. Existing partial output without a completion marker is reported as
 `INCOMPLETE` and left untouched.
+
+### Postprocess into `_review`
+
+`postprocess_review.py` reads the per-bag CSV files and moves matching NPZ/PNG
+pairs into their respective `_review` directories. It is a dry run unless
+`--apply` is supplied. `--mae-rule both` requires both MAE limits to fail;
+`PREFIX=140` reviews frames 1 through 139 and keeps frame 140.
+
+```bash
+python3 make_gt/postprocess_review.py \
+  --out-dir out_data/BATCH \
+  --mae-0-2-max 1 --mae-2-5-max 2 --mae-rule both \
+  --dirty-before 0827_session_bag01=140
+```
+
+After checking the preview, repeat the command with `--apply`. An audit CSV
+named `postprocess_review_YYYYMMDD_HHMMSS.csv` is created in the batch root.
 
 ### Direct single-bag output
 

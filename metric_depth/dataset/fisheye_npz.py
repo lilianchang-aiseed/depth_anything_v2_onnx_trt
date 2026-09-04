@@ -4,7 +4,12 @@ Target is `depth_aligned` == 1/(s*DA_Small + t): DA-V2-Small relative disparity
 scaled by the per-frame RealSense affine. Regressing it distils (DA-Small +
 affine) into a single metric net -> monocular deploy, no RealSense, no SML.
 
-Returns image (3,h,w normalized RGB), depth (h,w metres), valid_mask (h,w bool).
+Returns image (3,h,w normalized RGB), depth (h,w metres), valid_mask (h,w bool)
+and far_mask (h,w bool).
+
+Clamp datasets may additionally contain ``metric_valid_mask`` and ``far_mask``.
+For those samples, ``valid_mask`` remains exact-metric-only and ``far_mask`` is
+returned separately so a training script can apply a one-sided far loss.
 
 Augmentation (train mode only; ported from train_sml_global.py):
   * horizontal flip (p=0.5)                 -- image + depth together
@@ -27,7 +32,7 @@ class FisheyeNPZ(Dataset):
     def __init__(self, filelist_path, mode, size=(518, 518),
                  target_key="depth_aligned", fallback_key="rs_depth_L",
                  use_stored_valid=True, min_depth=0.2, max_depth=20.0,
-                 sky_as_far=False,
+                 sky_as_far=False, far_depth=None,
                  augment=None,
                  aug_hflip=True, aug_brightness=0.3, aug_contrast=0.2,
                  aug_gamma=0.0, aug_noise_std=0.0118, aug_noise_p=0.3):
@@ -40,6 +45,7 @@ class FisheyeNPZ(Dataset):
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
         self.sky_as_far = bool(sky_as_far)
+        self.far_depth = None if far_depth is None else float(far_depth)
 
         self.augment = (mode == "train") if augment is None else bool(augment)
         self.aug_hflip = bool(aug_hflip)
@@ -94,28 +100,47 @@ class FisheyeNPZ(Dataset):
         image = self._load_image(z["left"])
         key = self.target_key if self.target_key in z.files else self.fallback_key
         depth = np.asarray(z[key], dtype=np.float32).copy()
+        explicit_far = key == "depth_aligned" and "far_mask" in z.files
+        separate_far = explicit_far or self.far_depth is not None
+        far_mask = (np.asarray(z["far_mask"], dtype=bool).copy()
+                    if explicit_far else np.zeros(depth.shape, dtype=bool))
 
         invalid = ~np.isfinite(depth) | (depth <= 0)
         invalid |= (depth < self.min_depth) | (depth > self.max_depth)
-        if self.use_stored_valid and key == "depth_aligned" and "valid_mask" in z.files:
-            invalid |= ~z["valid_mask"].astype(bool)
+        if self.use_stored_valid and key == "depth_aligned":
+            mask_key = ("metric_valid_mask" if "metric_valid_mask" in z.files
+                        else "valid_mask" if "valid_mask" in z.files else None)
+            if mask_key:
+                invalid |= ~z[mask_key].astype(bool)
+
         if self.sky_as_far and "sky_mask" in z.files:
             sky = z["sky_mask"].astype(bool)
-            depth[sky] = self.max_depth
-            invalid[sky] = False
+            if separate_far:
+                far_mask |= sky
+            else:
+                # Preserve the legacy behavior for old datasets/training code.
+                depth[sky] = self.max_depth
+                invalid[sky] = False
+
+        if separate_far:
+            invalid |= far_mask
+
         depth[invalid] = np.nan   # NaN -> valid_mask, mirroring the Hypersim loader
 
-        # ---- augmentation (train only); NaN in depth carries invalidity through ----
+        # ---- augmentation (train only); keep every spatial array aligned ----
         if self.augment:
             rng = np.random.default_rng()
             if self.aug_hflip and rng.random() < 0.5:
                 image = image[:, ::-1].copy()
                 depth = depth[:, ::-1].copy()
+                far_mask = far_mask[:, ::-1].copy()
             image = self._photometric(image, rng)
 
-        sample = self.transform({"image": image, "depth": depth})
+        sample = self.transform({"image": image, "depth": depth,
+                                 "mask": far_mask.astype(np.float32)})
         sample["image"] = torch.from_numpy(sample["image"])
         sample["depth"] = torch.from_numpy(sample["depth"])
+        sample["far_mask"] = torch.from_numpy(sample.pop("mask") > 0.5)
         sample["valid_mask"] = (torch.isnan(sample["depth"]) == 0)
         sample["depth"][sample["valid_mask"] == 0] = 0
         sample["image_path"] = path

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run make_gt_depthanything.py sequentially for every MCAP under one folder.
+# Run make_gt_depthanything_clamp.py sequentially for every MCAP under one folder.
 #
 # Example:
 #   bash make_gt/run_all_bags.sh \
@@ -7,13 +7,14 @@
 #     --gt-config make_gt/gt_config_0828.yaml \
 #     --out-dir out_data/0901_batch
 #
-# Extra make_gt arguments can be appended after --, for example:
+# Extra clamp-generator arguments can be appended after --, for example:
 #   bash make_gt/run_all_bags.sh ... -- --no-sky --fit-samples 12000
 
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_root="$(dirname -- "$script_dir")"
+generator_script="$script_dir/make_gt_depthanything_clamp.py"
 python_bin="python3"
 bag_dir="${COMMON_SHARE:+$COMMON_SHARE/bags/nx-2.0/0901}"
 out_dir="$project_root/out_data/0901_batch"
@@ -37,7 +38,13 @@ Options:
   --python PATH          Python executable. Default: python3
   --dry-run              Print commands without running inference.
   -h, --help             Show this help.
-  -- ARGS...             Forward remaining arguments to make_gt_depthanything.py.
+  -- ARGS...             Forward remaining arguments to the clamp GT generator.
+
+Clamp defaults:
+  --fit-mode isotonic-pchip
+  --metric-depth-max 15
+  --far-depth 19
+  --model-max-depth 20
 
 Flat output shared by all MCAP files:
   OUT_DIR/dataset/       All NPZ files
@@ -110,6 +117,10 @@ if [[ -z "$gt_config" ]]; then
 fi
 if [[ ! -f "$gt_config" ]]; then
   echo "GT config does not exist: $gt_config" >&2
+  exit 2
+fi
+if [[ ! -f "$generator_script" ]]; then
+  echo "Clamp GT generator does not exist: $generator_script" >&2
   exit 2
 fi
 bag_dir="$(realpath -- "$bag_dir")"
@@ -264,7 +275,7 @@ for bag_path in "${mcap_files[@]}"; do
   fi
 
   command=(
-    "$python_bin" "$script_dir/make_gt_depthanything.py"
+    "$python_bin" "$generator_script"
     --bag "$bag_path"
     --gt-config "$gt_config"
   )

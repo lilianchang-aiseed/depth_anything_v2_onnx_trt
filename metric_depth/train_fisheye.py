@@ -27,7 +27,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 
 from dataset.fisheye_npz import FisheyeNPZ
-from depth_anything_v2.dpt import DepthAnythingV2
+from model_metric_depth.dpt import DepthAnythingV2
 from util.loss import SiLogLoss
 from util.metric import eval_depth
 
