@@ -30,6 +30,7 @@ Deps: rosbags, numpy, opencv-python, torch, transformers, pillow
 """
 import argparse
 import os
+import csv
 from pathlib import Path
 
 import cv2
@@ -61,8 +62,21 @@ T_LI = np.array([
 
 TOPIC_DEPTH = "/d455/d455_node/depth/image_rect_raw"          # depth in infra1 frame
 TOPIC_DEPTH_INFO = "/d455/d455_node/depth/camera_info"
-TOPIC_LEFT = "/stereo_1_0/left/image_rect"
-TOPIC_DISP = "/stereo_1_0/disparity"
+
+# TOPIC_LEFT = "/stereo_1_0/left/image_rect"
+# TOPIC_DISP = "/stereo_1_0/disparity"
+# TOPIC_RIGHT = "/stereo_1_0/right/image_rect"
+
+TOPIC_LEFT = "/stereo_2_1/left/image_rect"
+TOPIC_DISP = "/stereo_2_1/disparity"
+TOPIC_RIGHT = "/stereo_2_1/right/image_rect"
+
+# Max squared normalized radius (tan^2 of incidence angle) allowed when warping
+# depth through the left/right radtan model. Beyond this the plumb-bob distortion
+# polynomial is unreliable and can fold points onto the wrong side of the image.
+# tan(60 deg)^2 = 3.0 covers a generous FOV while rejecting the grazing-angle
+# blow-up that puts stray points in the sky. Override per-run if needed.
+_MAX_TAN2 = float(np.tan(np.radians(62.0)) ** 2)
 
 
 # --------------------------------------------------------------------------- #
@@ -264,6 +278,31 @@ def calib_extract_left_to_d455_infra1(calib):
             f"expected a stereo-left <-> D455-infra1 calibration; got "
             f"cam0={c0.get('topic')} cam1={c1.get('topic')}")
     return K, dist, T_L_I455
+
+
+def calib_extract_left_right(calib):
+    """
+    From a stereo left <-> right camchain, return
+      (K_left, dist_left, K_right, dist_right, T_{R <- L}).
+    Kalibr T_1_0 with cam0=left, cam1=right is T_{R <- L} directly; the other
+    ordering is inverted. 'right' is detected by a '/stereo_' + '/right' topic.
+    """
+    def is_left(cam):
+        return "stereo" in cam["topic"] and "left" in cam["topic"]
+    def is_right(cam):
+        return "stereo" in cam["topic"] and "right" in cam["topic"]
+    c0, c1, T10 = calib["cam0"], calib["cam1"], calib["T_1_0"]
+    if is_left(c0) and is_right(c1):
+        Kl, dl = c0["K"], c0["dist"]; Kr, dr = c1["K"], c1["dist"]
+        T_R_L = T10                                  # cam0->cam1 = L->R
+    elif is_right(c0) and is_left(c1):
+        Kr, dr = c0["K"], c0["dist"]; Kl, dl = c1["K"], c1["dist"]
+        T_R_L = np.linalg.inv(T10)
+    else:
+        raise ValueError(
+            f"expected a stereo left <-> right calibration; got "
+            f"cam0={c0.get('topic')} cam1={c1.get('topic')}")
+    return Kl, dl, Kr, dr, T_R_L
 
 
 # --------------------------------------------------------------------------- #
@@ -546,7 +585,23 @@ def step2_ir_depth_to_L(depth_I_m, K_I, T_L_I, cam1_proj, cam1_dist, out_hw,
     xn = P1[:, 0] / Z1; yn = P1[:, 1] / Z1
     k1, k2, p1, p2 = cam1_dist
     r2 = xn * xn + yn * yn
+
+    # ---- angular / distortion-validity gate -----------------------------------
+    # The radtan (plumb-bob) model  rad = 1 + k1 r2 + k2 r2^2  is only valid for
+    # points inside the calibrated field of view. For a wide (fisheye-derived
+    # rectified) camera, points at grazing angles have a huge r2, where:
+    #   * rad can go negative -> (xd,yd) flip sign -> the pixel lands on the
+    #     OPPOSITE side of the image (the stray "line in the sky"), and
+    #   * the projection is meaningless anyway.
+    # Reject those points: keep only where rad stays physical (monotone-increasing
+    # distortion, positive) AND the incidence angle is within a sane bound.
     rad = 1 + k1 * r2 + k2 * r2 * r2
+    drad = 1 + 3 * k1 * r2 + 5 * k2 * r2 * r2                # d(r_distorted)/d(r) sign
+    ang_ok = r2 <= _MAX_TAN2                                 # |tan(theta)| bound
+    valid_dist = (rad > 0) & (drad > 0) & ang_ok
+    xn = xn[valid_dist]; yn = yn[valid_dist]; r2 = r2[valid_dist]
+    rad = rad[valid_dist]; Z1 = Z1[valid_dist]
+
     xd = xn * rad + 2 * p1 * xn * yn + p2 * (r2 + 2 * xn * xn)
     yd = yn * rad + p1 * (r2 + 2 * yn * yn) + 2 * p2 * xn * yn
     fx1, fy1, cx1, cy1 = cam1_proj
@@ -624,8 +679,71 @@ def robust_affine_invdepth(rel, inv_gt, valid, num=3000, ransac_iters=200,
     return s, t, float(keep.mean())
 
 
+def robust_affine_invdepth_binned(rel, inv_gt, valid, n_bins=6, min_per_bin=40,
+                                  num=6000, seed=0):
+    """
+    Per-frame PIECEWISE-linear fit of inv_gt = f(rel), continuous at the knots.
+
+    Splits the DA relative-disparity range into n_bins equal-count bins, robustly
+    fits a line in each, and stitches them into a continuous, monotone knot table.
+    Bins with < min_per_bin anchors inherit the nearest populated bin's slope.
+    Returns (knot_rel, knot_inv) as float arrays of length n_bins+1, or None if
+    there aren't enough anchors to fit even one bin.
+
+    This is the per-image analogue of fit_global_scale_shift-10bins.py. On sparse
+    frames prefer a small n_bins (4-6); a single frame rarely populates 10 bins.
+    """
+    rng = np.random.default_rng(seed)
+    ys, xs = np.where(valid)
+    if len(xs) < max(50, n_bins * min_per_bin // 2):
+        return None
+    if len(xs) > num:
+        sel = rng.choice(len(xs), num, replace=False)
+        ys, xs = ys[sel], xs[sel]
+    d = rel[ys, xs].astype(np.float64)
+    y = inv_gt[ys, xs].astype(np.float64)
+
+    edges = np.percentile(d, np.linspace(0, 100, n_bins + 1))
+    edges[0] -= 1e-6; edges[-1] += 1e-6
+    edges = np.maximum.accumulate(edges)                     # de-dup ties
+
+    slopes = np.full(n_bins, np.nan); offs = np.full(n_bins, np.nan)
+    for b in range(n_bins):
+        m = (d >= edges[b]) & (d < edges[b + 1])
+        if int(m.sum()) >= min_per_bin:
+            fit = robust_affine_invdepth(
+                rel, inv_gt, valid & _in_range_mask(rel, edges[b], edges[b + 1]),
+                num=num, ransac_iters=120)
+            if fit is not None:
+                slopes[b] = fit[0]
+                offs[b] = np.median(y[m] - fit[0] * d[m])
+    vi = np.where(np.isfinite(slopes))[0]
+    if len(vi) == 0:
+        return None
+    for b in range(n_bins):                                  # fill sparse bins
+        if not np.isfinite(slopes[b]):
+            j = vi[np.argmin(np.abs(vi - b))]
+            slopes[b] = slopes[j]; offs[b] = offs[j]
+
+    kd = edges.copy(); ki = np.zeros(n_bins + 1)
+    ki[0] = slopes[0] * kd[0] + offs[0]
+    for b in range(n_bins):
+        ki[b + 1] = slopes[b] * kd[b + 1] + offs[b]
+    for b in range(1, n_bins):                               # continuity at knots
+        lp = slopes[b - 1] * kd[b] + offs[b - 1]
+        rp = slopes[b] * kd[b] + offs[b]
+        ki[b] = 0.5 * (lp + rp)
+    ki = np.maximum.accumulate(ki)                           # monotone in rel
+    return kd.astype(np.float32), ki.astype(np.float32)
+
+
+def _in_range_mask(rel, lo, hi):
+    return (rel >= lo) & (rel < hi)
+
+
 def step3_fit_metric_L(da_L, rs_depth_L, anchor_valid, da_metric=False,
-                       max_depth=30.0):
+                       max_depth=30.0, fit_mode="affine", fit_bins=6,
+                       extrap_near=False, extrap_near_margin_m=1.0):
     """
     Fit DA(left) -> metric using the RS anchors, then convert the WHOLE da_L to
     metric depth. Pixels the fit pushes beyond `max_depth` (or to <=0) are marked
@@ -644,17 +762,61 @@ def step3_fit_metric_L(da_L, rs_depth_L, anchor_valid, da_metric=False,
     valid_anchor = anchor_valid & np.isfinite(rs_depth_L) & (rs_depth_L > 0)
     inv_gt = np.zeros_like(rs_depth_L)
     inv_gt[valid_anchor] = 1.0 / rs_depth_L[valid_anchor]
+
+    # Anchor disparity range. Pixels whose DA-disparity falls outside this range
+    # are EXTRAPOLATED by the fit, not interpolated -- their output is a wild
+    # guess (piecewise clamps to the endpoint knot, affine flies to +/- infinity
+    # as disparity approaches zero). Gate them so far-background garbage stays
+    # NaN. Optionally allow extrapolation on the NEAR side (higher disparity =
+    # closer than any RS anchor) for obstacle-avoidance safety: DA often sees a
+    # near obstacle that RS missed, and the fit's near extrapolation is bounded
+    # (mapping stays monotone and finite for high disparity).
+    if valid_anchor.any():
+        da_anchor_min = float(da_L[valid_anchor].min())
+        da_anchor_max = float(da_L[valid_anchor].max())
+    else:
+        da_anchor_min, da_anchor_max = -np.inf, np.inf
+    if extrap_near:
+        # DA/stereo convention: higher disparity => higher inv-depth => CLOSER.
+        # So "near extrapolation" means allowing DA disparities ABOVE da_anchor_max.
+        # We still reject the far side (disparity below da_anchor_min => sky/far bg).
+        in_anchor_range = (da_L >= da_anchor_min)
+    else:
+        in_anchor_range = (da_L >= da_anchor_min) & (da_L <= da_anchor_max)
+
+    if fit_mode == "piecewise":
+        kk = robust_affine_invdepth_binned(da_L, inv_gt, valid_anchor, n_bins=fit_bins)
+        if kk is not None:
+            knot_rel, knot_inv = kk
+            ga_inv = np.interp(da_L, knot_rel, knot_inv).astype(np.float32)
+            thr = 1.0 / max_depth
+            good = (np.isfinite(ga_inv) & (ga_inv > thr) & in_anchor_range)
+            depth_L = np.full_like(da_L, np.nan, dtype=np.float32)
+            depth_L[good] = (1.0 / ga_inv[good]).astype(np.float32)
+            # inlier proxy: fraction of anchors within 10% of the piecewise curve
+            pa = np.interp(da_L[valid_anchor], knot_rel, knot_inv)
+            ia = inv_gt[valid_anchor]
+            inl = float((np.abs(pa - ia) / np.maximum(ia, 1e-6) < 0.1).mean())
+            return depth_L, {"mode": "piecewise", "bins": fit_bins, "inl": inl,
+                             "knot_rel": knot_rel.tolist(), "knot_inv": knot_inv.tolist(),
+                             "coverage": float(good.mean()),
+                             "da_range": (da_anchor_min, da_anchor_max),
+                             "s": float((knot_inv[-1]-knot_inv[0]) /
+                                        max(knot_rel[-1]-knot_rel[0], 1e-6))}
+        # fall through to affine if piecewise couldn't fit (too few anchors)
+
     fit = robust_affine_invdepth(da_L, inv_gt, valid_anchor)
     if fit is None:
         return None, {}
     s, t, inl = fit
     ga_inv = s * da_L + t
     thr = 1.0 / max_depth
-    good = np.isfinite(ga_inv) & (ga_inv > thr)
+    good = np.isfinite(ga_inv) & (ga_inv > thr) & in_anchor_range
     depth_L = np.full_like(da_L, np.nan, dtype=np.float32)
     depth_L[good] = (1.0 / ga_inv[good]).astype(np.float32)
     return depth_L, {"mode": "affine", "s": s, "t": t, "inl": inl,
-                     "coverage": float(good.mean())}
+                     "coverage": float(good.mean()),
+                     "da_range": (da_anchor_min, da_anchor_max)}
 
 
 # --------------------------------------------------------------------------- #
@@ -707,7 +869,7 @@ def build_montage(left_img, da_L, depth_I, rs_depth_L, anchor_valid, depth_L, in
     left_bgr = _to_bgr(left_img)
     da_rel = _rel_bgr(da_L)
     depthI_col = _depth_bgr(depth_I, np.isfinite(depth_I) & (depth_I > 0), dmin, dmax)
-    rs_anchor = _depth_bgr(rs_depth_L, anchor_valid, dmin, dmax)
+    rs_anchor = _depth_bgr(rs_depth_L, np.isfinite(rs_depth_L) & (rs_depth_L > 0), dmin, dmax)
     dL = _depth_bgr(depth_L, np.isfinite(depth_L), dmin, dmax)
     fov = _to_bgr((fov_mask.astype(np.uint8) * 255))
     gtm = _depth_bgr(depth_L, gt_valid, dmin, dmax)
@@ -755,7 +917,12 @@ def build_montage(left_img, da_L, depth_I, rs_depth_L, anchor_valid, depth_L, in
 def fit_is_suspect(depth_L, gt_valid, info, min_spread, min_s, min_inl):
     """
     Flag a collapsed / poorly-fit frame: one where almost all pixels map to a
-    similar depth (affine slope ~0), or the fit had few inliers.
+    similar depth (fit slid to slope ~0), or the fit had few inliers.
+
+    Applies to BOTH affine and piecewise fits:
+      * `spread`: p90/p10 of the final GT depth (~1.0 => all pixels same depth)
+      * `slope` : affine s, or piecewise effective slope (Delta inv_depth / Delta rel)
+      * `inl`  : fit inlier fraction (fraction of anchors within tolerance)
 
     Returns (suspect: bool, reasons: list[str]).
     """
@@ -767,11 +934,27 @@ def fit_is_suspect(depth_L, gt_valid, info, min_spread, min_s, min_inl):
     spread = p90 / max(p10, 1e-6)                 # ~1.0 => all pixels same depth
     if spread < min_spread:
         reasons.append(f"spread={spread:.2f}<{min_spread}")
-    if info.get("mode") == "affine":
-        if abs(info.get("s", 0.0)) < min_s:
-            reasons.append(f"s={info.get('s',0):.4f}<{min_s}")
-        if info.get("inl", 1.0) < min_inl:
-            reasons.append(f"inl={info.get('inl',0):.2f}<{min_inl}")
+
+    # slope + inlier checks apply to affine AND piecewise.
+    # For piecewise, `s` in the info dict is the effective end-to-end slope
+    # (dInv/dRel across the whole range), computed in step3_fit_metric_L.
+    if info.get("mode") in ("affine", "piecewise"):
+        s = info.get("s", None)
+        if s is not None and abs(s) < min_s:
+            reasons.append(f"s={s:.4f}<{min_s}")
+        inl = info.get("inl", None)
+        if inl is not None and inl < min_inl:
+            reasons.append(f"inl={inl:.2f}<{min_inl}")
+
+    # extra piecewise-specific check: knot inverse-depth range must actually vary,
+    # otherwise the piecewise fit collapsed to a near-constant curve
+    if info.get("mode") == "piecewise" and "knot_inv" in info:
+        ki = np.asarray(info["knot_inv"], dtype=float)
+        if ki.size >= 2:
+            inv_span = float(ki[-1] - ki[0])
+            if inv_span < min_s * (float(np.max(info.get("knot_rel", [1.0]))) or 1.0):
+                reasons.append(f"knot_inv_span={inv_span:.4f} (near-flat piecewise)")
+
     return (len(reasons) > 0), reasons
 
 
@@ -793,6 +976,16 @@ def main():
     ap.add_argument("--max-fit-depth", type=float, default=10.0)
     ap.add_argument("--no-splat", action="store_true",
                     help="disable 2x2 splat (leave sub-pixel holes in the warp)")
+    ap.add_argument("--warp-max-angle-deg", type=float, default=62.0,
+                    help="reject warped points whose incidence angle exceeds this "
+                         "(guards the radtan distortion blow-up that folds stray points "
+                         "into the sky). Lower if you still see stray points; raise if "
+                         "legitimate wide-FOV background is being dropped.")
+    ap.add_argument("--gt-support-dilate", type=int, default=4,
+                    help="dilate the RS-observed region by this many px before gating "
+                         "GT; DA may fill holes within this margin but not extrapolate "
+                         "into large unobserved regions (far background/sky). 0 = require "
+                         "an exact RS measurement at every GT pixel.")
     ap.add_argument("--tile", type=int, default=300)
     # ---- sky segmentation (NCNN) ----
     ap.add_argument("--sky-param", default=None, help="NCNN .param for sky seg")
@@ -833,12 +1026,17 @@ def main():
     ap.add_argument("--d435-depth", default=None,
                     help="D435 depth topic; enables the 2nd warp. Pair with "
                          "--d435-source to say which frame it's in.")
-    ap.add_argument("--d435-source", choices=["color", "infra1", "kalibr_infra1"], default="color",
+    ap.add_argument("--d435-source",
+                    choices=["color", "infra1", "kalibr_infra1", "kalibr_color_via_d2c"],
+                    default="color",
                     help="color: topic is aligned_depth_to_color (D435 color frame, 4-hop chain); "
                          "infra1: topic is raw depth/image_rect_raw with factory D435 D2C extrinsic (3-hop); "
                          "kalibr_infra1: raw depth + a direct D455-infra1 <-> D435-infra1 Kalibr "
-                         "calibration (--d435-calib), 2-hop, cleanest -- USE THIS when you have "
-                         "the newer infra1<->infra1 calibration.")
+                         "calibration (--d435-calib), 2-hop, cleanest; "
+                         "kalibr_color_via_d2c: raw depth + a D455-color <-> D435-color Kalibr "
+                         "calibration, composed with FACTORY Depth->Color extrinsics on each side "
+                         "to get an effective infra1<->infra1 chain -- use when your rig only has "
+                         "a color<->color calibration but you want to use raw depth.")
     ap.add_argument("--d435-calib", default=None,
                     help="path to a Kalibr camchain .txt. For --d435-source kalibr_infra1 it must be "
                          "the D455-infra1 <-> D435-infra1 calibration; for --d435-source color it may "
@@ -849,6 +1047,11 @@ def main():
     ap.add_argument("--d435-info", default=None,
                     help="D435 camera_info topic to read intrinsics for --d435-source infra1")
     ap.add_argument("--d435-depth-scale", type=float, default=0.001)
+    ap.add_argument("--d435-max-depth", type=float, default=6.0,
+                    help="clamp D435 depth to this reliable range (m) before it "
+                         "becomes an anchor/merge; D435 is noisy past ~6 m. 0 = no clamp.")
+    ap.add_argument("--d455-max-depth", type=float, default=20.0,
+                    help="clamp D455 depth to this reliable range (m). 0 = no clamp.")
     ap.add_argument("--d435-time-offset", type=float, default=0.0)
     ap.add_argument("--d435-merge", choices=["fill", "min"], default="fill",
                     help="fill: D455 wins, D435 fills holes; min: nearer of the two")
@@ -874,6 +1077,30 @@ def main():
                     help="(deprecated, no-op) the D455-infra1 intrinsics consistency "
                          "check has been removed; this flag is accepted for backward "
                          "compatibility but does nothing")
+    # ---- fit mode: single affine vs per-frame piecewise ----
+    ap.add_argument("--fit-mode", choices=["affine", "piecewise"], default="affine",
+                    help="affine: one (scale,shift) per frame (default). piecewise: "
+                         "per-frame binned fit of DA-disparity -> RS inverse-depth "
+                         "(configurable --fit-bins), captures curvature.")
+    ap.add_argument("--fit-bins", type=int, default=6,
+                    help="number of disparity bins for --fit-mode piecewise "
+                         "(keep small, 4-6, for sparse per-frame anchors)")
+    ap.add_argument("--extrap-near", action="store_true",
+                    help="allow the fit to extrapolate on the NEAR side (higher DA "
+                         "disparity than any RS anchor) -- useful for obstacle avoidance "
+                         "when DA sees a close obstacle RS missed. FAR-side extrapolation "
+                         "(disparities below any anchor -> sky/background) stays rejected.")
+    # ---- right rectified image GT (uses the left<->right calibration) ----
+    ap.add_argument("--targets", choices=["left", "right", "both"], default="left",
+                    help="which rectified image(s) to produce GT for. right/both "
+                         "require --lr-calib. Right GT is for monocular DA distillation "
+                         "(no matching disparity, has_disp=False).")
+    ap.add_argument("--lr-calib", default=None,
+                    help="Kalibr camchain .txt for stereo-left <-> stereo-right. "
+                         "Provides right intrinsics and T_{R<-L}; required for "
+                         "--targets right/both.")
+    ap.add_argument("--right-topic", default=TOPIC_RIGHT,
+                    help="right rectified image topic (default: %(default)s)")
     # ---- inline QC: route collapsed/poor fits to a review subfolder ----
     ap.add_argument("--no-qc", action="store_true",
                     help="disable the inline collapsed-fit gate")
@@ -885,7 +1112,28 @@ def main():
                     help="flag if |affine slope| below this (fit collapsed to s~0)")
     ap.add_argument("--qc-min-inl", type=float, default=0.3,
                     help="flag if fit inlier fraction below this")
+    ap.add_argument("--stats-csv", default=None,
+                    help="write per-frame QC stats to this CSV (one row per "
+                         "processed target, both kept and suspect). Lets you "
+                         "eyeball false positives (good frames flagged) and "
+                         "false negatives (bad frames kept) offline.")
     args = ap.parse_args()
+
+    # apply warp incidence-angle gate from CLI (module-global read by step2)
+    global _MAX_TAN2
+    _MAX_TAN2 = float(np.tan(np.radians(args.warp_max_angle_deg)) ** 2)
+    print(f"warp incidence gate: reject > {args.warp_max_angle_deg:.0f} deg "
+          f"(tan^2 = {_MAX_TAN2:.2f})")
+
+    # gt-max-depth must not exceed max-fit-depth. Anchors above max-fit-depth are
+    # excluded from the fit, so any predicted depth beyond max-fit-depth is an
+    # extrapolation, not an interpolation -- exactly the "far background maps to
+    # wrong metric depth" symptom. Cap and warn instead of silently corrupting.
+    if args.gt_max_depth > args.max_fit_depth:
+        print(f"NOTE: capping --gt-max-depth from {args.gt_max_depth} to "
+              f"--max-fit-depth {args.max_fit_depth} (anchors don't cover "
+              f"beyond max-fit-depth, so GT past that would be extrapolated).")
+        args.gt_max_depth = args.max_fit_depth
 
     # Fresh rig geometry: override T_LI / left intrinsics from --left-calib.
     if args.left_calib:
@@ -897,6 +1145,24 @@ def main():
         print(f"[left-calib] {os.path.basename(args.left_calib)}: "
               f"T_L<-I455 t={np.round(T_LI[:3,3],4)}  "
               f"left K={tuple(round(v,2) for v in K_left)}")
+
+    # Right-frame geometry from the left<->right calibration (for --targets right/both)
+    want_right = args.targets in ("right", "both")
+    want_left  = args.targets in ("left", "both")
+    K_right = dist_right = T_R_I = None
+    if want_right:
+        if not args.lr_calib:
+            raise SystemExit("--targets right/both requires --lr-calib "
+                             "(a stereo left <-> right Kalibr .txt)")
+        _lr = parse_kalibr_camchain_txt(args.lr_calib)
+        _Kl, _dl, K_right, dist_right, T_R_L = calib_extract_left_right(_lr)
+        K_right = np.array(K_right); dist_right = np.array(dist_right)
+        # RS infra1 depth -> right frame: T_{R<-I} = T_{R<-L} . T_{L<-I}
+        T_R_I = T_R_L @ T_LI
+        _T_R_L_saved = T_R_L
+        print(f"[lr-calib] {os.path.basename(args.lr_calib)}: "
+              f"right K={tuple(round(v,2) for v in K_right)}  "
+              f"T_R<-L t={np.round(T_R_L[:3,3],4)}  T_R<-I t={np.round(T_R_I[:3,3],4)}")
 
     device = "cuda"
     try:
@@ -920,7 +1186,25 @@ def main():
               f"(min_spread={args.qc_min_spread} min_s={args.qc_min_s} "
               f"min_inl={args.qc_min_inl})")
 
+    # optional per-frame stats log (one row per processed target, kept or suspect)
+    stats_fh = None; stats_writer = None
+    if args.stats_csv:
+        os.makedirs(os.path.dirname(os.path.abspath(args.stats_csv)) or ".", exist_ok=True)
+        stats_fh = open(args.stats_csv, "w", newline="")
+        stats_writer = csv.writer(stats_fh)
+        stats_writer.writerow([
+            "frame", "target", "suspect", "reasons",
+            "spread", "s", "inl", "gt_valid_frac",
+            "anchors", "cov455", "cov435", "merged_cov", "n_gt_pixels",
+            "fit_mode", "da_min", "da_max",
+            "warp_near_pct", "warp_mid_pct", "warp_far_pct",
+            "kept",
+        ])
+        print(f"  stats CSV: {args.stats_csv}")
+
     topics = [args.d455_depth, args.d455_info, TOPIC_LEFT, TOPIC_DISP]
+    if want_right:
+        topics.append(args.right_topic)
     if args.d435_depth:
         topics.append(args.d435_depth)
     if args.d435_info:
@@ -1002,7 +1286,56 @@ def main():
             d435_src_dist = dist_from_calib                  # non-zero radtan from calib
             K_d435 = tuple(args.d435_proj) if args.d435_proj is not None else K_from_calib
 
+        elif args.d435_source == "kalibr_color_via_d2c":
+            # Raw depth (D435 infra1 frame) + a COLOR<->COLOR Kalibr calibration.
+            # We derive T_{I455<-I435} by composing:
+            #   T_{I455<-I435} = inv(T_{C455<-I455}) . T_{C455<-C435} . T_{C435<-I435}
+            # where the D2C hops come from RealSense factory extrinsics (accurate;
+            # they were the origin of D455_D2C_R/t and D435_D2C_R/t constants).
+            # This lets rigs without an infra1<->infra1 Kalibr calibration still
+            # use raw depth with a valid intrinsic/frame match.
+            if parsed is None:
+                raise SystemExit("--d435-source kalibr_color_via_d2c requires --d435-calib "
+                                 "(a D455-color <-> D435-color Kalibr .txt)")
+            _Kc_from_calib, _distc_from_calib, T_C455_C435_ovr = \
+                calib_extract_d435_color_to_d455_color(parsed)
+            T_c455_i455 = (make_T(np.array(args.d455_d2c_R).reshape(3, 3),
+                                  np.array(args.d455_d2c_t))
+                           if args.d455_d2c_R is not None and args.d455_d2c_t is not None
+                           else make_T(D455_D2C_R, D455_D2C_t))
+            T_c435_i435 = (make_T(np.array(args.d435_d2c_R).reshape(3, 3),
+                                  np.array(args.d435_d2c_t))
+                           if args.d435_d2c_R is not None and args.d435_d2c_t is not None
+                           else make_T(D435_D2C_R, D435_D2C_t))
+            T_I455_I435 = np.linalg.inv(T_c455_i455) @ T_C455_C435_ovr @ T_c435_i435
+            T_L_D435 = T_LI @ T_I455_I435
+            d435_src_dist = None                              # rectified infra1 = pinhole
+            if args.d435_proj is not None:
+                K_d435 = tuple(args.d435_proj)
+            elif args.d435_info and data.get(args.d435_info):
+                kk = np.array(data[args.d435_info][0][1].k).reshape(3, 3)
+                K_d435 = (kk[0, 0], kk[1, 1], kk[0, 2], kk[1, 2])
+            else:
+                raise SystemExit("--d435-source kalibr_color_via_d2c needs D435 infra1 "
+                                 "intrinsics: pass --d435-proj fx fy cx cy, or --d435-info "
+                                 "/d435/d435_node/depth/camera_info (the bag has this topic)")
+
         elif args.d435_source == "color":
+            # Guard: --d435-source color expects depth in the D435 COLOR frame.
+            # The RealSense driver publishes that on `aligned_depth_to_color`;
+            # `depth/image_rect_raw` is in the D435 infra1 frame and would be
+            # back-projected with the wrong intrinsics -> points fly into the sky.
+            if "aligned_depth_to_color" not in args.d435_depth:
+                raise SystemExit(
+                    "ERROR: --d435-source color needs depth in the D435 COLOR frame, "
+                    "but --d435-depth is:\n"
+                    f"  {args.d435_depth}\n"
+                    "  * If your bag has it, use  --d435-depth "
+                    "/d435/d435_node/aligned_depth_to_color/image_raw\n"
+                    "  * Or, to use raw depth (D435 infra1 frame), pass:\n"
+                    "      --d435-source kalibr_infra1 --d435-calib "
+                    "<a D455-infra1 <-> D435-infra1 Kalibr .txt>\n"
+                    "    (a COLOR<->COLOR calib will not work with raw infra1 depth)")
             T_c455_i455 = (make_T(np.array(args.d455_d2c_R).reshape(3, 3),
                                   np.array(args.d455_d2c_t))
                            if args.d455_d2c_R is not None and args.d455_d2c_t is not None
@@ -1077,118 +1410,300 @@ def main():
             disp_L = cv2.resize(disp, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_NEAREST)
         disp_valid_L = np.isfinite(disp_L) & (disp_L > 0)
 
-        # ---- STEP 1 ----
-        da_L = step1_da_on_left(proc, model, left, device)
-        # ---- STEP 2 (D455 infra1 depth -> left, single Kalibr hop) ----
-        rs_depth_L = step2_ir_depth_to_L(depth_I, K_I, T_LI, CAM1_PROJ, CAM1_DIST,
-                                         out_hw, splat=not args.no_splat)
-        cover455 = float(np.isfinite(rs_depth_L).mean())
+    # D435->right transform (only when both D435 and right target are active)
+    T_R_D435 = None
+    if want_right and d435_enabled:
+        T_R_D435 = _T_R_L_saved @ T_L_D435
 
-        # ---- STEP 2b (D435 depth -> left) merged in ----
-        cover435 = 0.0
-        if d435_enabled:
-            d435m = nearest(data[args.d435_depth],
-                            t_anchor - args.d435_time_offset, args.sync_tol)
-            if d435m is not None:
-                depth_435 = image_to_numpy(d435m[1]).astype(np.float32) * args.d435_depth_scale
-                d435_L = step2_ir_depth_to_L(
-                    depth_435, K_d435, T_L_D435, CAM1_PROJ, CAM1_DIST, out_hw,
-                    splat=not args.no_splat, src_dist=d435_src_dist)
-                cover435 = float(np.isfinite(d435_L).mean())
-                rs_depth_L = merge_depth_L(rs_depth_L, d435_L, mode=args.d435_merge)
+    def process_target(idx, name, img, K_cam, dist_cam, T_cam_I, T_cam_D435,
+                       depth_I, depth_435, t_anchor, disp_L, disp_valid_L, disp_raw):
+        """Run steps 2-6 for one rectified image (left or right). Returns
+        (kept: bool, suspect: bool, cov_txt: str)."""
+        cam_hw = img.shape[:2]
+        # ---- STEP 1: DA on this image ----
+        da = step1_da_on_left(proc, model, img, device)
+        # ---- STEP 2: RS infra1 depth -> this frame ----
+        # D455 reliable range clamp: readings beyond d455_max_depth are noisy.
+        depth_I_clamped = np.where(
+            (depth_I > 0) & (depth_I <= args.d455_max_depth), depth_I, np.nan
+        ).astype(np.float32) if args.d455_max_depth > 0 else depth_I
+        rs_depth = step2_ir_depth_to_L(depth_I_clamped, K_I, T_cam_I, K_cam, dist_cam,
+                                       cam_hw, splat=not args.no_splat)
+        cov455 = float(np.isfinite(rs_depth).mean())
+        # ---- STEP 2b: D435 -> this frame merged ----
+        cov435 = 0.0
+        if depth_435 is not None and T_cam_D435 is not None:
+            # D435 has a MUCH shorter reliable range than the D455 (~6 m vs ~20 m);
+            # readings past d435_max_depth are noise and would corrupt the fit.
+            d435_clamped = np.where(
+                (depth_435 > 0) & (depth_435 <= args.d435_max_depth), depth_435, np.nan
+            ).astype(np.float32) if args.d435_max_depth > 0 else depth_435
+            d435_c = step2_ir_depth_to_L(d435_clamped, K_d435, T_cam_D435, K_cam, dist_cam,
+                                         cam_hw, splat=not args.no_splat, src_dist=d435_src_dist)
+            cov435 = float(np.isfinite(d435_c).mean())
+            rs_depth = merge_depth_L(rs_depth, d435_c, mode=args.d435_merge)
 
-        fov = deploy_mask if deploy_mask is not None else disp_valid_L
-
-        # SKY region-of-interest: the fisheye DISK (image content), NOT `fov`.
-        # `fov` for anchors is disp_valid_L when no --deploy-mask is given, but
-        # sky has near-zero disparity -> `& fov` here would erase ~all sky.
-        # Use the deploy mask if we have one (it IS the disk); otherwise infer
-        # the disk from left-image brightness (>8 = has image content).
-        if deploy_mask is not None:
+        # FOV: left uses disparity support (if no deploy mask); right has no
+        # matching disparity, so it uses the image disk.
+        if deploy_mask is not None and deploy_mask.shape == cam_hw:
+            fov = deploy_mask
+        elif disp_valid_L is not None:
+            fov = disp_valid_L
+        else:
+            g8 = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            fov = g8 > 8
+        # sky ROI = disk
+        if deploy_mask is not None and deploy_mask.shape == cam_hw:
             sky_fov = deploy_mask
         else:
-            g8 = left if left.ndim == 2 else cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+            g8 = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             sky_fov = g8 > 8
 
-        # ---- SKY: segment, then EXCLUDE from the fit anchors ----
-        left_bgr = left if left.ndim == 3 else cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
+        img_bgr = img if img.ndim == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         if sky_seg is not None:
-            sky_mask = sky_seg.mask(left_bgr) & sky_fov
+            sky_mask = sky_seg.mask(img_bgr) & sky_fov
         elif args.sky_heuristic:
-            sky_mask = heuristic_sky_mask(left, sky_fov)
+            sky_mask = heuristic_sky_mask(img, sky_fov)
         else:
-            sky_mask = np.zeros(out_hw, dtype=bool)
+            sky_mask = np.zeros(cam_hw, dtype=bool)
 
-        anchor_valid = (np.isfinite(rs_depth_L) & (rs_depth_L > args.dmin)
-                        & (rs_depth_L < args.max_fit_depth) & fov & ~sky_mask)
+        anchor_valid = (np.isfinite(rs_depth) & (rs_depth > args.dmin)
+                        & (rs_depth < args.max_fit_depth) & fov & ~sky_mask)
         if anchor_valid.sum() < 50:
-            if n_skipped_anchors < 5:
-                print(f"  [skip @ disp t={t_anchor:.3f}] anchors={int(anchor_valid.sum())}<50  "
-                      f"rs_cover={np.isfinite(rs_depth_L).mean()*100:.0f}% "
-                      f"fov={fov.mean()*100:.0f}% sky={sky_mask.mean()*100:.0f}% "
-                      f"rs_in_range={((np.isfinite(rs_depth_L))&(rs_depth_L>args.dmin)&(rs_depth_L<args.max_fit_depth)).mean()*100:.0f}%")
-            n_skipped_anchors += 1
-            continue
-        # ---- STEP 3 ----
-        depth_L, info = step3_fit_metric_L(da_L, rs_depth_L, anchor_valid,
-                                           args.da_metric, max_depth=args.gt_max_depth)
-        if depth_L is None:
-            if n_skipped_fit < 5:
-                print(f"  [skip @ disp t={t_anchor:.3f}] fit returned None "
-                      f"(anchors={int(anchor_valid.sum())})")
-            n_skipped_fit += 1
-            continue
-        depth_L[sky_mask] = np.nan        # sky has no valid metric depth (viz + safety)
-        # ---- STEP 4 ----
-        # GT valid where the fit is reliable AND disparity exists AND NOT sky.
-        # Sky is exported as its own mask; train_sml_global.py assigns it a fixed
-        # far depth so it doesn't need a metric value here.
-        gt_valid = fov & np.isfinite(depth_L) & (depth_L > 0) & disp_valid_L & ~sky_mask
-        gt_final = np.where(gt_valid, depth_L, np.nan).astype(np.float32)
+            return False, False, f"{name}: anchors<50", [], {"target": name, "reason": "anchors<50"}
+        # ---- STEP 3: fit ----
+        depth_c, info = step3_fit_metric_L(da, rs_depth, anchor_valid,
+                                           args.da_metric, max_depth=args.gt_max_depth,
+                                           fit_mode=args.fit_mode, fit_bins=args.fit_bins,
+                                           extrap_near=args.extrap_near)
+        if depth_c is None:
+            return False, False, f"{name}: fit failed", [], {"target": name, "reason": "fit failed"}
+        depth_c[sky_mask] = np.nan
+        # ---- STEP 4: GT validity ----
+        # RS-support gate: only keep GT where the warped RS depth actually gave
+        # a measurement (optionally dilated so DA may fill small holes BETWEEN
+        # anchors, but never extrapolate into large unobserved regions like the
+        # far background/sky). This is the key fix for "far pixels with no RS
+        # anchor get a wrong metric depth" -- most important for the right target,
+        # which has no disparity gate of its own.
+        rs_support = np.isfinite(rs_depth) & (rs_depth > 0)
+        if args.gt_support_dilate > 0:
+            k = int(args.gt_support_dilate)
+            rs_support = cv2.dilate(rs_support.astype(np.uint8),
+                                    np.ones((2 * k + 1, 2 * k + 1), np.uint8)) > 0
+        if disp_valid_L is not None:      # left: require disparity support too
+            gt_valid = (fov & np.isfinite(depth_c) & (depth_c > 0)
+                        & disp_valid_L & rs_support & ~sky_mask)
+        else:                             # right: no disparity; RS support is the gate
+            gt_valid = (fov & np.isfinite(depth_c) & (depth_c > 0)
+                        & rs_support & ~sky_mask)
+        gt_final = np.where(gt_valid, depth_c, np.nan).astype(np.float32)
 
-        # ---- QC: is this a collapsed / poor fit? ----
+        # ---- QC ----
         suspect, reasons = (False, [])
         if qc_on:
             suspect, reasons = fit_is_suspect(
-                depth_L, gt_valid, info,
-                args.qc_min_spread, args.qc_min_s, args.qc_min_inl)
-        vis_dir = review_vis if (qc_on and suspect) else args.vis_dir
-        exp_dir = (review_export if (qc_on and suspect) else args.export_dir)
+                depth_c, gt_valid, info, args.qc_min_spread, args.qc_min_s, args.qc_min_inl)
+        vdir = review_vis if (qc_on and suspect) else args.vis_dir
+        edir = review_export if (qc_on and suspect) else args.export_dir
 
-        # ---- STEP 6 (viz) ----
-        montage = build_montage(left, da_L, depth_I, rs_depth_L, anchor_valid,
-                                depth_L, info, fov, gt_valid, disp_L,
+        # Stats behind the QC decision (used in the review print). Compute even
+        # when NOT suspect so a --qc-debug pass shows margins.
+        d_valid = depth_c[gt_valid & np.isfinite(depth_c)]
+        if d_valid.size >= 2:
+            _p10, _p90 = np.percentile(d_valid, [10, 90])
+            spread_val = float(_p90 / max(_p10, 1e-6))
+        else:
+            spread_val = 0.0
+        stats = {
+            "target": name,
+            "spread": spread_val,
+            "s": float(info.get("s", 0.0)) if info.get("mode") in ("affine", "piecewise") else None,
+            "inl": float(info.get("inl", 0.0)) if info.get("mode") in ("affine", "piecewise") else None,
+            "gt_valid_frac": float(gt_valid.mean()),
+            "anchors": int(anchor_valid.sum()),
+            "cov455": float(cov455), "cov435": float(cov435),
+            "merged_cov": float(np.isfinite(rs_depth).mean()),
+            "n_gt_pixels": int(d_valid.size),
+            "fit_mode": info.get("mode", "?"),
+            "da_range": info.get("da_range", None),
+        }
+        # depth-band % of the warp (near/mid/far) -- included in stats for CSV
+        _rsv_stats = rs_depth[np.isfinite(rs_depth) & (rs_depth > 0)]
+        if _rsv_stats.size:
+            stats["warp_near_pct"] = float((_rsv_stats < 5).mean() * 100)
+            stats["warp_mid_pct"]  = float(((_rsv_stats >= 5) & (_rsv_stats < 15)).mean() * 100)
+            stats["warp_far_pct"]  = float((_rsv_stats >= 15).mean() * 100)
+        else:
+            stats["warp_near_pct"] = stats["warp_mid_pct"] = stats["warp_far_pct"] = 0.0
+
+        # ---- STEP 6: montage ----
+        disp_for_viz = disp_L if disp_L is not None else np.zeros(cam_hw, np.float32)
+        montage = build_montage(img, da, depth_I, rs_depth, anchor_valid,
+                                depth_c, info, fov, gt_valid, disp_for_viz,
                                 args.tile, args.dmin, args.dmax, sky_mask=sky_mask)
-        cv2.imwrite(os.path.join(vis_dir, f"gt_{n:04d}.png"), montage)
+        suffix = "" if name == "left" else f"_{name}"
+        cv2.imwrite(os.path.join(vdir, f"gt_{idx:04d}{suffix}.png"), montage)
 
-        # ---- STEP 5 (export) ----
-        if exp_dir:
-            np.savez_compressed(
-                os.path.join(exp_dir, f"sample_{n:04d}.npz"),
-                disp=disp.astype(np.float32),
+        # ---- STEP 5: export ----
+        if edir:
+            has_disp = disp_raw is not None
+            disp_out = (disp_raw.astype(np.float32) if has_disp
+                        else np.zeros(cam_hw, np.float32))
+            payload = dict(
+                disp=disp_out,
                 depth_aligned=gt_final,
-                left=left,
+                left=img,                          # 'left' key kept for loader compat
                 valid_mask=gt_valid.astype(np.bool_),
                 sky_mask=(sky_mask & sky_fov).astype(np.bool_),
-                has_disp=np.bool_(True),
+                has_disp=np.bool_(has_disp),
                 stamp=np.float64(t_anchor),
+                target=name,
             )
+            if info.get("mode") == "piecewise":     # store knots for reference
+                payload["knot_rel"] = np.array(info["knot_rel"], np.float32)
+                payload["knot_inv"] = np.array(info["knot_inv"], np.float32)
+            np.savez_compressed(
+                os.path.join(edir, f"sample_{idx:04d}{suffix}.npz"), **payload)
 
-        if suspect:
+        # depth-band coverage of the WARP output (diagnose whether far survives)
+        _rsv = rs_depth[np.isfinite(rs_depth) & (rs_depth > 0)]
+        if _rsv.size:
+            _near = float((_rsv < 5).mean() * 100)
+            _mid = float(((_rsv >= 5) & (_rsv < 15)).mean() * 100)
+            _far = float((_rsv >= 15).mean() * 100)
+            band = f" [warp depth: <5m {_near:.0f}% 5-15m {_mid:.0f}% >15m {_far:.0f}%]"
+        else:
+            band = " [warp depth: none]"
+        fitmsg = (f"s={info.get('s',0):.2f} inl={info.get('inl',0)*100:.0f}%"
+                  if info.get("mode") in ("affine", "piecewise")
+                  else f"x{info.get('ratio',1):.2f}")
+        cov = (f"{name}: D455={cov455*100:.0f}% D435={cov435*100:.0f}% "
+               f"merged={np.isfinite(rs_depth).mean()*100:.0f}% "
+               f"fit[{fitmsg}] GTvalid={gt_valid.mean()*100:.0f}%{band}")
+        return True, suspect, cov, reasons, stats
+
+    n = 0
+    n_suspect = 0
+    n_skipped_sync = 0
+    n_skipped_anchors = 0
+    n_skipped_fit = 0
+    for t_anchor, disp_msg in data[TOPIC_DISP]:
+        if n >= args.max_pairs:
+            break
+        dm = nearest(data[args.d455_depth], t_anchor - args.depth_time_offset, args.sync_tol)
+        lm = nearest(data[TOPIC_LEFT], t_anchor, args.sync_tol)
+        if dm is None or lm is None:
+            if n_skipped_sync < 5:
+                print(f"  [skip @ disp t={t_anchor:.3f}] "
+                      f"depth={'MISS' if dm is None else 'ok'} "
+                      f"left={'MISS' if lm is None else 'ok'}")
+            n_skipped_sync += 1
+            continue
+
+        depth_I = image_to_numpy(dm[1]).astype(np.float32) * args.depth_scale
+        left = image_to_numpy(lm[1])
+        disp = image_to_numpy(disp_msg).astype(np.float32)
+        if disp.ndim == 3:
+            print("  disparity is 3-channel (colorized); log raw 32FC1. skipping.")
+            continue
+        disp_L = disp
+        if disp.shape != out_hw:
+            disp_L = cv2.resize(disp, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_NEAREST)
+        disp_valid_L = np.isfinite(disp_L) & (disp_L > 0)
+
+        # right image (optional)
+        right_img = None
+        if want_right:
+            rm = nearest(data[args.right_topic], t_anchor, args.sync_tol)
+            if rm is not None:
+                right_img = image_to_numpy(rm[1])
+
+        # D435 depth (shared by both targets)
+        depth_435 = None
+        if d435_enabled:
+            d435m = nearest(data[args.d435_depth], t_anchor - args.d435_time_offset, args.sync_tol)
+            if d435m is not None:
+                depth_435 = image_to_numpy(d435m[1]).astype(np.float32) * args.d435_depth_scale
+
+        kept_any = False
+        suspect_any = False
+        cov_msgs = []
+        all_reasons = []   # list of (target, reasons, stats) for review print
+
+        def _log_stats(target, kept, suspect, reasons, stats):
+            if stats_writer is None:
+                return
+            da = stats.get("da_range") or (None, None)
+            stats_writer.writerow([
+                n, target, int(bool(suspect)), ";".join(reasons) if reasons else "",
+                f"{stats.get('spread', 0):.4f}",
+                (f"{stats['s']:.6f}" if stats.get("s") is not None else ""),
+                (f"{stats['inl']:.4f}" if stats.get("inl") is not None else ""),
+                f"{stats.get('gt_valid_frac', 0):.4f}",
+                stats.get("anchors", 0),
+                f"{stats.get('cov455', 0):.4f}",
+                f"{stats.get('cov435', 0):.4f}",
+                f"{stats.get('merged_cov', 0):.4f}",
+                stats.get("n_gt_pixels", 0),
+                stats.get("fit_mode", ""),
+                (f"{da[0]:.4f}" if da[0] is not None else ""),
+                (f"{da[1]:.4f}" if da[1] is not None else ""),
+                f"{stats.get('warp_near_pct', 0):.2f}",
+                f"{stats.get('warp_mid_pct', 0):.2f}",
+                f"{stats.get('warp_far_pct', 0):.2f}",
+                int(bool(kept)),
+            ])
+
+        if want_left:
+            k, s, c, reasons, stats = process_target(
+                n, "left", left, CAM1_PROJ, CAM1_DIST, T_LI,
+                (T_L_D435 if d435_enabled else None),
+                depth_I, depth_435, t_anchor, disp_L, disp_valid_L, disp)
+            kept_any |= k; suspect_any |= s
+            if c: cov_msgs.append(c)
+            if s: all_reasons.append((("left"), reasons, stats))
+            _log_stats("left", k, s, reasons, stats)
+            if not k and n_skipped_anchors < 5 and "anchors" in c:
+                print(f"  [skip @ t={t_anchor:.3f}] {c}"); n_skipped_anchors += 1
+            elif not k and n_skipped_fit < 5 and "fit" in c:
+                print(f"  [skip @ t={t_anchor:.3f}] {c}"); n_skipped_fit += 1
+
+        if want_right and right_img is not None:
+            k, s, c, reasons, stats = process_target(
+                n, "right", right_img, K_right, dist_right, T_R_I,
+                (T_R_D435 if d435_enabled else None),
+                depth_I, depth_435, t_anchor, None, None, None)
+            kept_any |= k; suspect_any |= s
+            if c: cov_msgs.append(c)
+            if s: all_reasons.append((("right"), reasons, stats))
+            _log_stats("right", k, s, reasons, stats)
+
+        if suspect_any:
             n_suspect += 1
-            print(f"  [review] frame {n} -> {args.qc_subdir}/  ({', '.join(reasons)})")
+            # Explain WHY the frame is being routed to _review, with the exact
+            # threshold(s) that fired and the stats behind them.
+            print(f"  [review] frame {n} -> {args.qc_subdir}/")
+            for tgt, reasons, st in all_reasons:
+                sv = st.get("spread", 0.0); sc = st.get("s"); il = st.get("inl")
+                gv = st.get("gt_valid_frac", 0.0)
+                s_str = f"s={sc:.4f}" if sc is not None else "s=n/a"
+                i_str = f"inl={il:.2f}" if il is not None else "inl=n/a"
+                print(f"      {tgt}: {', '.join(reasons)}")
+                print(f"         stats: spread(p90/p10)={sv:.2f} (thresh {args.qc_min_spread})  "
+                      f"{s_str} (thresh {args.qc_min_s})  "
+                      f"{i_str} (thresh {args.qc_min_inl})  "
+                      f"GTvalid={gv*100:.0f}%  anchors={st.get('anchors',0)}  "
+                      f"D455cov={st.get('cov455',0)*100:.0f}% D435cov={st.get('cov435',0)*100:.0f}%  "
+                      f"mode={st.get('fit_mode','?')}")
+        if n % 20 == 0 and cov_msgs:
+            print(f"  frame {n}: " + " | ".join(cov_msgs))
+        if kept_any:
+            n += 1
 
-        if n % 20 == 0:
-            fitmsg = (f"s={info['s']:.2f} inl={info['inl']*100:.0f}%"
-                      if info.get("mode") == "affine" else f"x{info.get('ratio',1):.2f}")
-            cov_txt = (f"cover D455={cover455*100:.0f}% D435={cover435*100:.0f}% "
-                       f"merged={np.isfinite(rs_depth_L).mean()*100:.0f}%"
-                       if d435_enabled else
-                       f"RS->L cover={np.isfinite(rs_depth_L).mean()*100:.0f}%")
-            print(f"  frame {n}: {cov_txt}  anchors={int(anchor_valid.sum())}  "
-                  f"fit[{fitmsg}]  GT valid={gt_valid.mean()*100:.0f}%")
-        n += 1
-
+    if stats_fh is not None:
+        stats_fh.close()
+        print(f"stats CSV written: {args.stats_csv}")
     print(f"done. {n} frames -> {args.vis_dir}"
           + (f" and {args.export_dir}" if args.export_dir else ""))
     total_disp = len(data[TOPIC_DISP])
