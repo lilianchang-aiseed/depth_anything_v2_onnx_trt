@@ -33,17 +33,21 @@ import argparse
 import csv
 import os
 import re
+from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
+from gt_fitting import select_fit_validation_masks, robust_affine_invdepth, _pava_increasing, _pchip_slopes, _pchip_evaluate, isotonic_pchip_invdepth, validation_depth_statistics, step3_fit_metric_L
 
 try:
     from .correct_matrix_direction import load_d455_d435, load_left_d455
+    from .ege_ncnn_sky import EgeNcnnSkySegmenter
 except ImportError:  # direct execution: python3 sml/make_gt/make_gt_depthanything.py
     from correct_matrix_direction import load_d455_d435, load_left_d455
+    from ege_ncnn_sky import EgeNcnnSkySegmenter
 
 TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
 # --------------------------------------------------------------------------- #
@@ -239,6 +243,64 @@ def load_topics(bagpath, topics):
     for t in out:
         out[t].sort(key=lambda x: x[0])
     return out
+
+
+def load_topics_sampled(bagpath, topics, disp_topic, frame_interval, sync_tol,
+                        topic_time_offsets, info_topics):
+    """Single-pass bag scan retaining only messages near sampled frames."""
+    out = {topic: [] for topic in topics}
+    scanned = {topic: 0 for topic in topics}
+    sampled_topics = {
+        topic for topic in topics
+        if topic != disp_topic and topic not in info_topics
+    }
+    recent = {topic: deque() for topic in sampled_topics}
+    active_targets = {topic: deque() for topic in sampled_topics}
+    history_window = max(
+        1.0,
+        4.0 * sync_tol +
+        max((abs(value) for value in topic_time_offsets.values()), default=0.0),
+    )
+
+    with AnyReader([Path(bagpath)], default_typestore=TYPESTORE) as reader:
+        conns = [c for c in reader.connections if c.topic in topics]
+        for conn, _, raw in reader.messages(connections=conns):
+            topic = conn.topic
+            source_frame = scanned[topic]
+            scanned[topic] += 1
+            if topic == disp_topic and source_frame % frame_interval != 0:
+                continue
+            if topic in info_topics and out[topic]:
+                continue
+            msg = reader.deserialize(raw, conn.msgtype)
+            stamp = stamp_to_sec(msg)
+            if topic in info_topics:
+                out[topic].append((stamp, msg))
+                continue
+            if topic == disp_topic:
+                out[topic].append((stamp, msg))
+                for sampled_topic in sampled_topics:
+                    target = stamp + topic_time_offsets.get(sampled_topic, 0.0)
+                    for recent_stamp, recent_msg in recent[sampled_topic]:
+                        if abs(recent_stamp - target) <= sync_tol:
+                            out[sampled_topic].append((recent_stamp, recent_msg))
+                    active_targets[sampled_topic].append(target)
+                continue
+
+            topic_recent = recent[topic]
+            topic_recent.append((stamp, msg))
+            while topic_recent and topic_recent[0][0] < stamp - history_window:
+                topic_recent.popleft()
+
+            targets = active_targets[topic]
+            while targets and stamp > targets[0] + sync_tol:
+                targets.popleft()
+            if any(abs(stamp - target) <= sync_tol for target in targets):
+                out[topic].append((stamp, msg))
+
+    for topic in out:
+        out[topic].sort(key=lambda item: item[0])
+    return out, scanned
 
 
 def nearest(sorted_list, t, tol):
@@ -569,289 +631,289 @@ def merge_depth_L(primary, secondary, mode="fill"):
 # =========================================================================== #
 # STEP 3 - robust affine fit  DA(left) -> metric depth (left frame)
 # =========================================================================== #
-def _weighted_choice(rng, depths, count, near_sample_weight):
-    """Sample without replacement, giving anchors at <=5 m extra weight."""
-    count = min(int(count), len(depths))
-    if count >= len(depths):
-        return np.arange(len(depths))
-    weights = np.ones(len(depths), dtype=np.float64)
-    weights[np.asarray(depths) <= 5.0] = float(near_sample_weight)
-    return rng.choice(len(depths), count, replace=False,
-                      p=weights / weights.sum())
+# def _weighted_choice(rng, depths, count, near_sample_weight):
+#     """Sample without replacement, giving anchors at <=5 m extra weight."""
+#     count = min(int(count), len(depths))
+#     if count >= len(depths):
+#         return np.arange(len(depths))
+#     weights = np.ones(len(depths), dtype=np.float64)
+#     weights[np.asarray(depths) <= 5.0] = float(near_sample_weight)
+#     return rng.choice(len(depths), count, replace=False,
+#                       p=weights / weights.sum())
 
 
-def select_fit_validation_masks(valid, depths, fit_samples,
-                                validation_ratio, near_sample_weight, rng=None):
-    """Create disjoint, near-weighted fitting and held-out validation masks."""
-    rng = rng if rng is not None else np.random.default_rng(0)
-    ys, xs = np.where(valid)
-    count = len(xs)
-    if count < 50:
-        return None, None
+# def select_fit_validation_masks(valid, depths, fit_samples,
+#                                 validation_ratio, near_sample_weight, rng=None):
+#     """Create disjoint, near-weighted fitting and held-out validation masks."""
+#     rng = rng if rng is not None else np.random.default_rng(0)
+#     ys, xs = np.where(valid)
+#     count = len(xs)
+#     if count < 50:
+#         return None, None
 
-    validation_count = int(round(count * validation_ratio))
-    validation_count = min(validation_count, max(0, count - 50))
-    validation_mask = np.zeros_like(valid, dtype=bool)
-    remaining = np.ones(count, dtype=bool)
-    if validation_count:
-        selected = _weighted_choice(
-            rng, depths[ys, xs], validation_count, near_sample_weight)
-        validation_mask[ys[selected], xs[selected]] = True
-        remaining[selected] = False
+#     validation_count = int(round(count * validation_ratio))
+#     validation_count = min(validation_count, max(0, count - 50))
+#     validation_mask = np.zeros_like(valid, dtype=bool)
+#     remaining = np.ones(count, dtype=bool)
+#     if validation_count:
+#         selected = _weighted_choice(
+#             rng, depths[ys, xs], validation_count, near_sample_weight)
+#         validation_mask[ys[selected], xs[selected]] = True
+#         remaining[selected] = False
 
-    fit_ys, fit_xs = ys[remaining], xs[remaining]
-    selected = _weighted_choice(
-        rng, depths[fit_ys, fit_xs], fit_samples, near_sample_weight)
-    fit_mask = np.zeros_like(valid, dtype=bool)
-    fit_mask[fit_ys[selected], fit_xs[selected]] = True
-    return fit_mask, validation_mask
-
-
-def robust_affine_invdepth(rel, inv_gt, valid, ransac_iters=200,
-                           iters=3, k=2.5, rng=None):
-    rng = rng if rng is not None else np.random.default_rng(0)
-    ys, xs = np.where(valid)
-    if len(xs) < 50:
-        return None
-    x = rel[ys, xs].astype(np.float64)
-    y = inv_gt[ys, xs].astype(np.float64)
-    tau = 0.3 * (1.4826 * np.median(np.abs(y - np.median(y))) + 1e-9)
-    bs, bt, bi, N = 1.0, 0.0, -1, len(x)
-    for _ in range(ransac_iters):
-        i, j = rng.integers(0, N, size=2)
-        if abs(x[i] - x[j]) < 1e-9:
-            continue
-        s = (y[i] - y[j]) / (x[i] - x[j]); t = y[i] - s * x[i]
-        inl = int((np.abs(y - (s * x + t)) < tau).sum())
-        if inl > bi:
-            bs, bt, bi = s, t, inl
-    s, t = bs, bt
-    keep = np.abs(y - (s * x + t)) < tau
-    for _ in range(iters):
-        if keep.sum() < 50:
-            break
-        A = np.stack([x[keep], np.ones(keep.sum())], axis=1)
-        sol, *_ = np.linalg.lstsq(A, y[keep], rcond=None)
-        s, t = float(sol[0]), float(sol[1])
-        res = y - (s * x + t); med = np.median(res[keep])
-        mad = 1.4826 * np.median(np.abs(res[keep] - med)) + 1e-9
-        keep = np.abs(res - med) < k * mad
-    return s, t, float(keep.mean()), int(keep.sum()), int(N)
+#     fit_ys, fit_xs = ys[remaining], xs[remaining]
+#     selected = _weighted_choice(
+#         rng, depths[fit_ys, fit_xs], fit_samples, near_sample_weight)
+#     fit_mask = np.zeros_like(valid, dtype=bool)
+#     fit_mask[fit_ys[selected], fit_xs[selected]] = True
+#     return fit_mask, validation_mask
 
 
-def _pava_increasing(values, weights):
-    """Weighted pool-adjacent-violators algorithm for nondecreasing values."""
-    levels, masses, starts, ends = [], [], [], []
-    for index, (value, weight) in enumerate(zip(values, weights)):
-        levels.append(float(value)); masses.append(float(weight))
-        starts.append(index); ends.append(index + 1)
-        while len(levels) >= 2 and levels[-2] > levels[-1]:
-            mass = masses[-2] + masses[-1]
-            level = (levels[-2] * masses[-2] + levels[-1] * masses[-1]) / mass
-            levels[-2:] = [level]; masses[-2:] = [mass]
-            ends[-2:] = [ends[-1]]; starts.pop()
-    output = np.empty(len(values), dtype=np.float64)
-    for level, start, end in zip(levels, starts, ends):
-        output[start:end] = level
-    return output
+# def robust_affine_invdepth(rel, inv_gt, valid, ransac_iters=200,
+#                            iters=3, k=2.5, rng=None):
+#     rng = rng if rng is not None else np.random.default_rng(0)
+#     ys, xs = np.where(valid)
+#     if len(xs) < 50:
+#         return None
+#     x = rel[ys, xs].astype(np.float64)
+#     y = inv_gt[ys, xs].astype(np.float64)
+#     tau = 0.3 * (1.4826 * np.median(np.abs(y - np.median(y))) + 1e-9)
+#     bs, bt, bi, N = 1.0, 0.0, -1, len(x)
+#     for _ in range(ransac_iters):
+#         i, j = rng.integers(0, N, size=2)
+#         if abs(x[i] - x[j]) < 1e-9:
+#             continue
+#         s = (y[i] - y[j]) / (x[i] - x[j]); t = y[i] - s * x[i]
+#         inl = int((np.abs(y - (s * x + t)) < tau).sum())
+#         if inl > bi:
+#             bs, bt, bi = s, t, inl
+#     s, t = bs, bt
+#     keep = np.abs(y - (s * x + t)) < tau
+#     for _ in range(iters):
+#         if keep.sum() < 50:
+#             break
+#         A = np.stack([x[keep], np.ones(keep.sum())], axis=1)
+#         sol, *_ = np.linalg.lstsq(A, y[keep], rcond=None)
+#         s, t = float(sol[0]), float(sol[1])
+#         res = y - (s * x + t); med = np.median(res[keep])
+#         mad = 1.4826 * np.median(np.abs(res[keep] - med)) + 1e-9
+#         keep = np.abs(res - med) < k * mad
+#     return s, t, float(keep.mean()), int(keep.sum()), int(N)
 
 
-def _pchip_slopes(x, y):
-    """Fritsch-Carlson derivatives used by monotone cubic Hermite interpolation."""
-    if len(x) == 2:
-        slope = (y[1] - y[0]) / (x[1] - x[0])
-        return np.array([slope, slope], dtype=np.float64)
-    h = np.diff(x)
-    delta = np.diff(y) / h
-    slopes = np.zeros_like(y)
-    same = delta[:-1] * delta[1:] > 0
-    w1 = 2.0 * h[1:] + h[:-1]
-    w2 = h[1:] + 2.0 * h[:-1]
-    interior = np.flatnonzero(same) + 1
-    slopes[interior] = ((w1[same] + w2[same]) /
-                        (w1[same] / delta[:-1][same] +
-                         w2[same] / delta[1:][same]))
-
-    def endpoint(h0, h1, d0, d1):
-        value = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1)
-        if np.sign(value) != np.sign(d0):
-            return 0.0
-        if np.sign(d0) != np.sign(d1) and abs(value) > abs(3.0 * d0):
-            return 3.0 * d0
-        return value
-
-    slopes[0] = endpoint(h[0], h[1], delta[0], delta[1])
-    slopes[-1] = endpoint(h[-1], h[-2], delta[-1], delta[-2])
-    return slopes
+# def _pava_increasing(values, weights):
+#     """Weighted pool-adjacent-violators algorithm for nondecreasing values."""
+#     levels, masses, starts, ends = [], [], [], []
+#     for index, (value, weight) in enumerate(zip(values, weights)):
+#         levels.append(float(value)); masses.append(float(weight))
+#         starts.append(index); ends.append(index + 1)
+#         while len(levels) >= 2 and levels[-2] > levels[-1]:
+#             mass = masses[-2] + masses[-1]
+#             level = (levels[-2] * masses[-2] + levels[-1] * masses[-1]) / mass
+#             levels[-2:] = [level]; masses[-2:] = [mass]
+#             ends[-2:] = [ends[-1]]; starts.pop()
+#     output = np.empty(len(values), dtype=np.float64)
+#     for level, start, end in zip(levels, starts, ends):
+#         output[start:end] = level
+#     return output
 
 
-def _pchip_evaluate(x, y, query):
-    """Evaluate monotone PCHIP, clamping instead of extrapolating past anchors."""
-    query = np.asarray(query, dtype=np.float64)
-    clipped = np.clip(query, x[0], x[-1])
-    index = np.clip(np.searchsorted(x, clipped, side="right") - 1, 0, len(x) - 2)
-    h = x[index + 1] - x[index]
-    u = (clipped - x[index]) / h
-    slopes = _pchip_slopes(x, y)
-    return ((2*u**3 - 3*u**2 + 1) * y[index]
-            + (u**3 - 2*u**2 + u) * h * slopes[index]
-            + (-2*u**3 + 3*u**2) * y[index + 1]
-            + (u**3 - u**2) * h * slopes[index + 1])
+# def _pchip_slopes(x, y):
+#     """Fritsch-Carlson derivatives used by monotone cubic Hermite interpolation."""
+#     if len(x) == 2:
+#         slope = (y[1] - y[0]) / (x[1] - x[0])
+#         return np.array([slope, slope], dtype=np.float64)
+#     h = np.diff(x)
+#     delta = np.diff(y) / h
+#     slopes = np.zeros_like(y)
+#     same = delta[:-1] * delta[1:] > 0
+#     w1 = 2.0 * h[1:] + h[:-1]
+#     w2 = h[1:] + 2.0 * h[:-1]
+#     interior = np.flatnonzero(same) + 1
+#     slopes[interior] = ((w1[same] + w2[same]) /
+#                         (w1[same] / delta[:-1][same] +
+#                          w2[same] / delta[1:][same]))
+
+#     def endpoint(h0, h1, d0, d1):
+#         value = ((2.0 * h0 + h1) * d0 - h0 * d1) / (h0 + h1)
+#         if np.sign(value) != np.sign(d0):
+#             return 0.0
+#         if np.sign(d0) != np.sign(d1) and abs(value) > abs(3.0 * d0):
+#             return 3.0 * d0
+#         return value
+
+#     slopes[0] = endpoint(h[0], h[1], delta[0], delta[1])
+#     slopes[-1] = endpoint(h[-1], h[-2], delta[-1], delta[-2])
+#     return slopes
 
 
-def isotonic_pchip_invdepth(rel, inv_gt, fit_mask, metric_depth_max):
-    """RANSAC-filtered, monotone DA-relative -> inverse-metric-depth curve."""
-    affine = robust_affine_invdepth(rel, inv_gt, fit_mask)
-    if affine is None:
-        return None
-    s, t, _, _, sample_count = affine
-    ys, xs = np.where(fit_mask)
-    x = rel[ys, xs].astype(np.float64)
-    y = inv_gt[ys, xs].astype(np.float64)
-    residual = y - (s * x + t)
-    median = np.median(residual)
-    mad = 1.4826 * np.median(np.abs(residual - median)) + 1e-9
-    keep = np.abs(residual - median) < 2.5 * mad
-    x, y = x[keep], y[keep]
-    if len(x) < 50:
-        return None
-
-    order = np.argsort(x)
-    x, y = x[order], y[order]
-    bins = np.array_split(np.arange(len(x)), min(128, len(x)))
-    knot_x = np.array([np.median(x[index]) for index in bins])
-    knot_y = np.array([np.median(y[index]) for index in bins])
-    knot_w = np.array([len(index) for index in bins], dtype=np.float64)
-    unique_x, inverse = np.unique(knot_x, return_inverse=True)
-    if len(unique_x) < 2:
-        return None
-    merged_y = np.zeros(len(unique_x), dtype=np.float64)
-    merged_w = np.zeros(len(unique_x), dtype=np.float64)
-    np.add.at(merged_y, inverse, knot_y * knot_w)
-    np.add.at(merged_w, inverse, knot_w)
-    merged_y /= merged_w
-    monotone_y = _pava_increasing(merged_y, merged_w)
-    mapped_inv = _pchip_evaluate(unique_x, monotone_y, rel)
-
-    threshold_inv = 1.0 / float(metric_depth_max)
-    unique_y, first = np.unique(monotone_y, return_index=True)
-    if threshold_inv <= unique_y[0]:
-        da_far_threshold = unique_x[0]
-    elif threshold_inv >= unique_y[-1]:
-        da_far_threshold = unique_x[-1]
-    else:
-        da_far_threshold = float(np.interp(threshold_inv, unique_y, unique_x[first]))
-    return mapped_inv, {
-        "mode": "isotonic-pchip", "s": s, "t": t,
-        "inl": float(keep.mean()), "inlier_count": int(keep.sum()),
-        "fit_sample_count": int(sample_count), "pchip_knots": int(len(unique_x)),
-        "da_min_anchor": float(unique_x[0]), "da_max_anchor": float(unique_x[-1]),
-        "da_far_threshold": float(da_far_threshold),
-    }
+# def _pchip_evaluate(x, y, query):
+#     """Evaluate monotone PCHIP, clamping instead of extrapolating past anchors."""
+#     query = np.asarray(query, dtype=np.float64)
+#     clipped = np.clip(query, x[0], x[-1])
+#     index = np.clip(np.searchsorted(x, clipped, side="right") - 1, 0, len(x) - 2)
+#     h = x[index + 1] - x[index]
+#     u = (clipped - x[index]) / h
+#     slopes = _pchip_slopes(x, y)
+#     return ((2*u**3 - 3*u**2 + 1) * y[index]
+#             + (u**3 - 2*u**2 + u) * h * slopes[index]
+#             + (-2*u**3 + 3*u**2) * y[index + 1]
+#             + (u**3 - u**2) * h * slopes[index + 1])
 
 
-def validation_depth_statistics(pred_depth, target_depth, validation_mask):
-    """Metric errors on anchors held out from scale/shift fitting."""
-    valid = (validation_mask & np.isfinite(pred_depth)
-             & np.isfinite(target_depth) & (target_depth > 0))
-    result = {
-        "validation_count": int(validation_mask.sum()),
-        "validation_valid_count": int(valid.sum()),
-        "val_mae_m": np.nan,
-        "val_rmse_m": np.nan,
-        "val_median_relative_error": np.nan,
-        "val_mae_lt5m": np.nan,
-        "val_mae_0_2m": np.nan,
-        "val_mae_2_5m": np.nan,
-        "val_mae_5_10m": np.nan,
-        "val_mae_10_20m": np.nan,
-    }
-    if not valid.any():
-        return result
+# def isotonic_pchip_invdepth(rel, inv_gt, fit_mask, metric_depth_max):
+#     """RANSAC-filtered, monotone DA-relative -> inverse-metric-depth curve."""
+#     affine = robust_affine_invdepth(rel, inv_gt, fit_mask)
+#     if affine is None:
+#         return None
+#     s, t, _, _, sample_count = affine
+#     ys, xs = np.where(fit_mask)
+#     x = rel[ys, xs].astype(np.float64)
+#     y = inv_gt[ys, xs].astype(np.float64)
+#     residual = y - (s * x + t)
+#     median = np.median(residual)
+#     mad = 1.4826 * np.median(np.abs(residual - median)) + 1e-9
+#     keep = np.abs(residual - median) < 2.5 * mad
+#     x, y = x[keep], y[keep]
+#     if len(x) < 50:
+#         return None
 
-    target = target_depth[valid].astype(np.float64)
-    error = np.abs(pred_depth[valid].astype(np.float64) - target)
-    result.update({
-        "val_mae_m": float(error.mean()),
-        "val_rmse_m": float(np.sqrt(np.mean(error ** 2))),
-        "val_median_relative_error": float(np.median(error / target)),
-    })
-    for name, low, high in (
-        ("val_mae_0_2m", 0.0, 2.0),
-        ("val_mae_2_5m", 2.0, 5.0),
-        ("val_mae_5_10m", 5.0, 10.0),
-        ("val_mae_10_20m", 10.0, 20.0),
-    ):
-        selected = (target >= low) & (target < high)
-        if selected.any():
-            result[name] = float(error[selected].mean())
-    selected = target < 5.0
-    if selected.any():
-        result["val_mae_lt5m"] = float(error[selected].mean())
-    return result
+#     order = np.argsort(x)
+#     x, y = x[order], y[order]
+#     bins = np.array_split(np.arange(len(x)), min(128, len(x)))
+#     knot_x = np.array([np.median(x[index]) for index in bins])
+#     knot_y = np.array([np.median(y[index]) for index in bins])
+#     knot_w = np.array([len(index) for index in bins], dtype=np.float64)
+#     unique_x, inverse = np.unique(knot_x, return_inverse=True)
+#     if len(unique_x) < 2:
+#         return None
+#     merged_y = np.zeros(len(unique_x), dtype=np.float64)
+#     merged_w = np.zeros(len(unique_x), dtype=np.float64)
+#     np.add.at(merged_y, inverse, knot_y * knot_w)
+#     np.add.at(merged_w, inverse, knot_w)
+#     merged_y /= merged_w
+#     monotone_y = _pava_increasing(merged_y, merged_w)
+#     mapped_inv = _pchip_evaluate(unique_x, monotone_y, rel)
+
+#     threshold_inv = 1.0 / float(metric_depth_max)
+#     unique_y, first = np.unique(monotone_y, return_index=True)
+#     if threshold_inv <= unique_y[0]:
+#         da_far_threshold = unique_x[0]
+#     elif threshold_inv >= unique_y[-1]:
+#         da_far_threshold = unique_x[-1]
+#     else:
+#         da_far_threshold = float(np.interp(threshold_inv, unique_y, unique_x[first]))
+#     return mapped_inv, {
+#         "mode": "isotonic-pchip", "s": s, "t": t,
+#         "inl": float(keep.mean()), "inlier_count": int(keep.sum()),
+#         "fit_sample_count": int(sample_count), "pchip_knots": int(len(unique_x)),
+#         "da_min_anchor": float(unique_x[0]), "da_max_anchor": float(unique_x[-1]),
+#         "da_far_threshold": float(da_far_threshold),
+#     }
 
 
-def step3_fit_metric_L(da_L, rs_depth_L, anchor_valid, da_metric=False,
-                       fit_mode="isotonic-pchip", metric_depth_max=15.0,
-                       fit_samples=10000,
-                       near_sample_weight=3.0, validation_ratio=0.2):
-    """
-    Fit DA(left) -> metric using the RS anchors, then convert the WHOLE da_L to
-    metric depth. The returned map is deliberately not upper-clipped: the caller
-    needs it to distinguish exact metric targets from the far class.
-    """
-    valid_anchor = (anchor_valid & np.isfinite(da_L) & (da_L > 0)
-                    & np.isfinite(rs_depth_L) & (rs_depth_L > 0))
-    rng = np.random.default_rng(0)
-    fit_mask, validation_mask = select_fit_validation_masks(
-        valid_anchor, rs_depth_L, fit_samples, validation_ratio,
-        near_sample_weight, rng=rng)
-    if fit_mask is None or fit_mask.sum() < 50:
-        return None, {}
+# def validation_depth_statistics(pred_depth, target_depth, validation_mask):
+#     """Metric errors on anchors held out from scale/shift fitting."""
+#     valid = (validation_mask & np.isfinite(pred_depth)
+#              & np.isfinite(target_depth) & (target_depth > 0))
+#     result = {
+#         "validation_count": int(validation_mask.sum()),
+#         "validation_valid_count": int(valid.sum()),
+#         "val_mae_m": np.nan,
+#         "val_rmse_m": np.nan,
+#         "val_median_relative_error": np.nan,
+#         "val_mae_lt5m": np.nan,
+#         "val_mae_0_2m": np.nan,
+#         "val_mae_2_5m": np.nan,
+#         "val_mae_5_10m": np.nan,
+#         "val_mae_10_20m": np.nan,
+#     }
+#     if not valid.any():
+#         return result
 
-    common_info = {
-        "anchor_count": int(valid_anchor.sum()),
-        "fit_sample_count": int(fit_mask.sum()),
-    }
-    if da_metric:
-        ratio = float(np.median(rs_depth_L[fit_mask] / da_L[fit_mask]))
-        out = (da_L * ratio).astype(np.float32)
-        out[~np.isfinite(out) | (out <= 0)] = np.nan
-        info = {"mode": "metric", "ratio": ratio, "inl": 1.0,
-                "inlier_count": int(fit_mask.sum()), **common_info}
-        info.update(validation_depth_statistics(
-            out, rs_depth_L, validation_mask))
-        return out, info
+#     target = target_depth[valid].astype(np.float64)
+#     error = np.abs(pred_depth[valid].astype(np.float64) - target)
+#     result.update({
+#         "val_mae_m": float(error.mean()),
+#         "val_rmse_m": float(np.sqrt(np.mean(error ** 2))),
+#         "val_median_relative_error": float(np.median(error / target)),
+#     })
+#     for name, low, high in (
+#         ("val_mae_0_2m", 0.0, 2.0),
+#         ("val_mae_2_5m", 2.0, 5.0),
+#         ("val_mae_5_10m", 5.0, 10.0),
+#         ("val_mae_10_20m", 10.0, 20.0),
+#     ):
+#         selected = (target >= low) & (target < high)
+#         if selected.any():
+#             result[name] = float(error[selected].mean())
+#     selected = target < 5.0
+#     if selected.any():
+#         result["val_mae_lt5m"] = float(error[selected].mean())
+#     return result
 
-    inv_gt = np.zeros_like(rs_depth_L)
-    inv_gt[valid_anchor] = 1.0 / rs_depth_L[valid_anchor]
-    fit = robust_affine_invdepth(da_L, inv_gt, fit_mask, rng=rng)
-    if fit is None:
-        return None, {}
-    s, t, inl, inlier_count, fit_sample_count = fit
-    if fit_mode == "isotonic-pchip":
-        curved = isotonic_pchip_invdepth(
-            da_L, inv_gt, fit_mask, metric_depth_max)
-        if curved is None:
-            return None, {}
-        ga_inv, curve_info = curved
-    else:
-        ga_inv = s * da_L + t
-        da_far_threshold = ((1.0 / metric_depth_max - t) / s
-                            if s > 0 else float(np.nanmin(da_L[fit_mask])))
-        curve_info = {
-            "mode": "affine", "s": s, "t": t, "inl": inl,
-            "inlier_count": inlier_count, "fit_sample_count": fit_sample_count,
-            "da_far_threshold": float(da_far_threshold),
-        }
-    good = np.isfinite(ga_inv) & (ga_inv > 0)
-    depth_L = np.full_like(da_L, np.nan, dtype=np.float32)
-    depth_L[good] = (1.0 / ga_inv[good]).astype(np.float32)
-    info = {**curve_info, **common_info,
-            "coverage": float(good.mean())}
-    info.update(validation_depth_statistics(
-        depth_L, rs_depth_L, validation_mask))
-    return depth_L, info
+
+# def step3_fit_metric_L(da_L, rs_depth_L, anchor_valid, da_metric=False,
+#                        fit_mode="isotonic-pchip", metric_depth_max=15.0,
+#                        fit_samples=10000,
+#                        near_sample_weight=3.0, validation_ratio=0.2):
+#     """
+#     Fit DA(left) -> metric using the RS anchors, then convert the WHOLE da_L to
+#     metric depth. The returned map is deliberately not upper-clipped: the caller
+#     needs it to distinguish exact metric targets from the far class.
+#     """
+#     valid_anchor = (anchor_valid & np.isfinite(da_L) & (da_L > 0)
+#                     & np.isfinite(rs_depth_L) & (rs_depth_L > 0))
+#     rng = np.random.default_rng(0)
+#     fit_mask, validation_mask = select_fit_validation_masks(
+#         valid_anchor, rs_depth_L, fit_samples, validation_ratio,
+#         near_sample_weight, rng=rng)
+#     if fit_mask is None or fit_mask.sum() < 50:
+#         return None, {}
+
+#     common_info = {
+#         "anchor_count": int(valid_anchor.sum()),
+#         "fit_sample_count": int(fit_mask.sum()),
+#     }
+#     if da_metric:
+#         ratio = float(np.median(rs_depth_L[fit_mask] / da_L[fit_mask]))
+#         out = (da_L * ratio).astype(np.float32)
+#         out[~np.isfinite(out) | (out <= 0)] = np.nan
+#         info = {"mode": "metric", "ratio": ratio, "inl": 1.0,
+#                 "inlier_count": int(fit_mask.sum()), **common_info}
+#         info.update(validation_depth_statistics(
+#             out, rs_depth_L, validation_mask))
+#         return out, info
+
+#     inv_gt = np.zeros_like(rs_depth_L)
+#     inv_gt[valid_anchor] = 1.0 / rs_depth_L[valid_anchor]
+#     fit = robust_affine_invdepth(da_L, inv_gt, fit_mask, rng=rng)
+#     if fit is None:
+#         return None, {}
+#     s, t, inl, inlier_count, fit_sample_count = fit
+#     if fit_mode == "isotonic-pchip":
+#         curved = isotonic_pchip_invdepth(
+#             da_L, inv_gt, fit_mask, metric_depth_max)
+#         if curved is None:
+#             return None, {}
+#         ga_inv, curve_info = curved
+#     else:
+#         ga_inv = s * da_L + t
+#         da_far_threshold = ((1.0 / metric_depth_max - t) / s
+#                             if s > 0 else float(np.nanmin(da_L[fit_mask])))
+#         curve_info = {
+#             "mode": "affine", "s": s, "t": t, "inl": inl,
+#             "inlier_count": inlier_count, "fit_sample_count": fit_sample_count,
+#             "da_far_threshold": float(da_far_threshold),
+#         }
+#     good = np.isfinite(ga_inv) & (ga_inv > 0)
+#     depth_L = np.full_like(da_L, np.nan, dtype=np.float32)
+#     depth_L[good] = (1.0 / ga_inv[good]).astype(np.float32)
+#     info = {**curve_info, **common_info,
+#             "coverage": float(good.mean())}
+#     info.update(validation_depth_statistics(
+#         depth_L, rs_depth_L, validation_mask))
+#     return depth_L, info
 
 
 # --------------------------------------------------------------------------- #
@@ -912,11 +974,16 @@ def build_montage(left_img, da_L, depth_I, rs_depth_L, anchor_valid, depth_L, in
     gt_display_valid = gt_valid if far_mask is None else (gt_valid | far_mask)
     gtm = _depth_bgr(gt_depth, gt_display_valid, dmin, dmax)
     dsp = _rel_bgr(disp, np.isfinite(disp) & (disp > 0))
-    fit_txt = (f"3 s={info.get('s',0):.2f} t={info.get('t',0):.2f} "
-               f"n={info.get('fit_sample_count',0)} "
-               f"inl={info.get('inl',0)*100:.0f}%"
-               if info.get("mode") == "affine"
-               else f"3 out metric(L) x{info.get('ratio',1):.2f}")
+    if info.get("mode") == "weighted-mse":
+        fit_txt = (f"3 weighted-MSE s={info.get('s',0):.2f} "
+                   f"t={info.get('t',0):.2f} "
+                   f"mse={info.get('weighted_invdepth_mse',np.nan):.3g}")
+    elif info.get("mode") in ("affine", "isotonic-pchip"):
+        fit_txt = (f"3 {info.get('mode')} s={info.get('s',0):.2f} "
+                   f"t={info.get('t',0):.2f} "
+                   f"inl={info.get('inl',0)*100:.0f}%")
+    else:
+        fit_txt = f"3 out metric(L) x{info.get('ratio',1):.2f}"
     merged_coverage = float(np.isfinite(rs_depth_L).mean())
     anchor_txt = (f"2 RS->L merged={merged_coverage*100:.0f}% "
                   f"anchors={info.get('anchor_count', 0)}")
@@ -970,9 +1037,10 @@ def fit_is_suspect(depth_L, gt_valid, info, min_spread, min_scale, min_inlier):
     spread = p90 / max(p10, 1e-6)
     if spread < min_spread:
         reasons.append(f"spread={spread:.2f}<{min_spread}")
-    if info.get("mode") in ("affine", "isotonic-pchip"):
+    if info.get("mode") in ("affine", "weighted-mse", "isotonic-pchip"):
         if abs(info.get("s", 0.0)) < min_scale:
             reasons.append(f"s={info.get('s', 0.0):.4f}<{min_scale}")
+    if info.get("mode") in ("affine", "isotonic-pchip"):
         if info.get("inl", 1.0) < min_inlier:
             reasons.append(f"inl={info.get('inl', 0.0):.2f}<{min_inlier}")
     return bool(reasons), reasons
@@ -982,6 +1050,7 @@ FIT_STATS_FIELDS = [
     "frame", "source_frame", "stamp", "fit_mode", "scale", "shift",
     "da_far_threshold",
     "anchor_count", "sample_count", "inlier_count", "inlier_ratio",
+    "weighted_invdepth_mse", "candidate_count",
     "validation_count", "validation_valid_count",
     "D455_coverage", "D435_coverage", "merged_coverage", "GT_valid_ratio",
     "far_ratio", "supervised_ratio",
@@ -1170,7 +1239,8 @@ def main():
     ap.add_argument("--model-max-depth", type=float,
                     default=runtime_cfg.get("model_max_depth", 20.0),
                     help="expected training-model output ceiling; metadata/safety check")
-    ap.add_argument("--fit-mode", choices=["affine", "isotonic-pchip"],
+    ap.add_argument("--fit-mode",
+                    choices=["affine", "weighted-mse", "isotonic-pchip"],
                     default=runtime_cfg.get("fit_mode", "isotonic-pchip"),
                     help="DA-relative to inverse-metric alignment model")
     ap.add_argument("--d435-merge", choices=["fill", "min"],
@@ -1361,9 +1431,21 @@ def main():
     if args.d435_info:
         topics.append(args.d435_info)
     print("reading bag...")
-    data = load_topics(args.bag, topics)
+    data, scanned_counts = load_topics_sampled(
+        args.bag,
+        topics,
+        args.disp_topic,
+        args.frame_interval,
+        args.sync_tol,
+        {
+            args.left_topic: 0.0,
+            args.d455_depth: -args.depth_time_offset,
+            args.d435_depth: -args.d435_time_offset,
+        },
+        {args.d455_info, args.d435_info},
+    )
     for t in topics:
-        print(f"  {t}: {len(data[t])}")
+        print(f"  {t}: scanned={scanned_counts[t]} retained={len(data[t])}")
 
     for required_topic in (args.d455_depth, args.left_topic, args.disp_topic):
         if not data.get(required_topic):
@@ -1410,11 +1492,11 @@ def main():
     elif args.sky_heuristic:
         print("  sky: brightness/texture heuristic")
     elif args.sky_param and args.sky_bin:
-        sky_seg = SkySegmenter(
+        sky_seg = EgeNcnnSkySegmenter(
             args.sky_param, args.sky_bin, size=args.sky_size,
             input_name=args.sky_input_name, output_name=args.sky_output_name,
             mean=tuple(args.sky_mean), norm=tuple(args.sky_norm),
-            sigmoid=not args.sky_no_sigmoid, thresh=args.sky_thresh,
+            threshold=args.sky_thresh,
             invert=args.sky_invert, use_gpu=args.sky_gpu,
             refine=args.sky_refine, refine_radius=args.sky_refine_radius,
             refine_eps=args.sky_refine_eps, refine_low=args.sky_refine_low,
@@ -1498,8 +1580,6 @@ def main():
     n_skipped_fit = 0
     selected_frames = 0
     for source_frame, (t_anchor, disp_msg) in enumerate(data[args.disp_topic]):
-        if source_frame % args.frame_interval != 0:
-            continue
         if n >= args.max_pairs:
             break
         selected_frames += 1
@@ -1529,22 +1609,26 @@ def main():
         # ---- STEP 1 ----
         da_L = step1_da_on_left(proc, model, left, device)
         # ---- STEP 2 (D455 infra1 depth -> left, single Kalibr hop) ----
-        rs_depth_L = step2_ir_depth_to_L(depth_I, K_I, T_LI, CAM1_PROJ, CAM1_DIST,
-                                         out_hw, splat=not args.no_splat)
-        cover455 = float(np.isfinite(rs_depth_L).mean())
+        d455_depth_L = step2_ir_depth_to_L(
+            depth_I, K_I, T_LI, CAM1_PROJ, CAM1_DIST,
+            out_hw, splat=not args.no_splat)
+        rs_depth_L = d455_depth_L.copy()
+        cover455 = float(np.isfinite(d455_depth_L).mean())
 
         # ---- STEP 2b (D435 depth -> left) merged in ----
         cover435 = 0.0
+        d435_depth_L = np.full(out_hw, np.nan, dtype=np.float32)
         if d435_enabled:
             d435m = nearest(data[args.d435_depth],
                             t_anchor - args.d435_time_offset, args.sync_tol)
             if d435m is not None:
                 depth_435 = image_to_numpy(d435m[1]).astype(np.float32) * args.d435_depth_scale
-                d435_L = step2_ir_depth_to_L(
+                d435_depth_L = step2_ir_depth_to_L(
                     depth_435, K_d435, T_L_D435, CAM1_PROJ, CAM1_DIST, out_hw,
                     splat=not args.no_splat, src_dist=d435_src_dist)
-                cover435 = float(np.isfinite(d435_L).mean())
-                rs_depth_L = merge_depth_L(rs_depth_L, d435_L, mode=args.d435_merge)
+                cover435 = float(np.isfinite(d435_depth_L).mean())
+                rs_depth_L = merge_depth_L(
+                    rs_depth_L, d435_depth_L, mode=args.d435_merge)
 
         fov = (deploy_mask if deploy_mask is not None
                else np.ones(out_hw, dtype=bool))
@@ -1626,6 +1710,9 @@ def main():
             "sample_count": info.get("fit_sample_count", 0),
             "inlier_count": info.get("inlier_count", 0),
             "inlier_ratio": info.get("inl", np.nan),
+            "weighted_invdepth_mse": info.get(
+                "weighted_invdepth_mse", np.nan),
+            "candidate_count": info.get("candidate_count", 0),
             "validation_count": info.get("validation_count", 0),
             "validation_valid_count": info.get("validation_valid_count", 0),
             "D455_coverage": cover455,
@@ -1664,6 +1751,8 @@ def main():
                 os.path.join(export_dir, f"{output_stem}.npz"),
                 # disp=disp.astype(np.float32),
                 depth_aligned=gt_final,
+                realsense_depth_d455_aligned=d455_depth_L.astype(np.float32),
+                realsense_depth_d435_aligned=d435_depth_L.astype(np.float32),
                 realsense_depth_merged=rs_depth_L.astype(np.float32),
                 left=left,
                 valid_mask=metric_valid.astype(np.bool_),
@@ -1684,7 +1773,10 @@ def main():
                   f"({', '.join(reasons)})")
 
         if n % 20 == 0:
-            fitmsg = (f"s={info['s']:.2f} inl={info['inl']*100:.0f}%"
+            fitmsg = (f"s={info['s']:.2f} "
+                      f"wmse={info.get('weighted_invdepth_mse', np.nan):.3g}"
+                      if info.get("mode") == "weighted-mse" else
+                      (f"s={info['s']:.2f} inl={info['inl']*100:.0f}%")
                       if info.get("mode") == "affine" else
                       (f"pchip={info.get('pchip_knots', 0)} "
                        f"inl={info.get('inl', 0)*100:.0f}%")

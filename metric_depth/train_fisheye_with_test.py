@@ -14,8 +14,12 @@ Example:
         --pretrained-from ../checkpoints/depth_anything_v2_vitb.pth \
         --save-path runs/fisheye_vitb
 
-Explicit splits require all three of ``--train-list``, ``--val-list``, and
-``--test-list``.
+Explicit training splits require all three of ``--train-list``, ``--val-list``,
+and ``--test-list``. Inference-only mode needs only ``--test-list``::
+
+    python train_fisheye_with_test.py --model-training false \
+        --test-list split/test.txt --checkpoint runs/example/best.pt \
+        --save-path runs/example_test
 """
 import argparse
 import csv
@@ -64,6 +68,17 @@ METRIC_KEYS = [
     'mae', 'mae_0.2_2m', 'mae_2_5m', 'mae_5_10m', 'mae_10_20m',
     'median_relative_error', 'valid_pixel_count',
 ]
+
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('true', '1', 'yes', 'on'):
+        return True
+    if value in ('false', '0', 'no', 'off'):
+        return False
+    raise argparse.ArgumentTypeError('expected true or false')
 
 
 # --------------------------------------------------------------------------- #
@@ -241,7 +256,31 @@ def _colorize(depth, mask, dmin, dmax):
     return color
 
 
-def save_vis(path, depth_gt, valid, pred, dmin, dmax, far_mask=None,
+def _display_input(image, out_hw):
+    image = image.detach().cpu().numpy() if torch.is_tensor(image) else np.asarray(image)
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)[:, None, None]
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)[:, None, None]
+    rgb = np.clip((image * std + mean) * 255.0, 0, 255).astype(np.uint8)
+    bgr = np.ascontiguousarray(rgb.transpose(1, 2, 0)[..., ::-1])
+    return cv2.resize(bgr, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_AREA)
+
+
+def _depth_colorbar(height, dmin, dmax):
+    bar_w, label_w = 18, 55
+    values = np.linspace(dmax, dmin, height, dtype=np.float32)[:, None]
+    norm = np.clip((values - dmin) / max(dmax - dmin, 1e-6), 0, 1)
+    colors = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    canvas = np.full((height, bar_w + label_w, 3), 40, dtype=np.uint8)
+    canvas[:, :bar_w] = np.repeat(colors, bar_w, axis=1)
+    for y, value in [(14, dmax), (height // 2, (dmin + dmax) / 2),
+                     (height - 5, dmin)]:
+        cv2.putText(canvas, f'{value:g}m', (bar_w + 3, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+    return canvas
+
+
+def save_vis(path, image, depth_gt, valid, pred, dmin, dmax, far_mask=None,
              far_depth=19.0):
     display_gt = depth_gt.clone()
     display_valid = valid.clone()
@@ -250,10 +289,14 @@ def save_vis(path, depth_gt, valid, pred, dmin, dmax, far_mask=None,
         display_valid |= far_mask
     gt_color = _colorize(display_gt, display_valid, dmin, dmax)
     pred_color = _colorize(pred, torch.ones_like(pred, dtype=torch.bool), dmin, dmax)
-    for image, text in [(gt_color, 'GT metric depth'), (pred_color, 'Prediction')]:
-        cv2.putText(image, text, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+    input_color = _display_input(image, gt_color.shape[:2])
+    for panel, text in [(input_color, 'Input image'),
+                        (gt_color, 'GT metric depth'),
+                        (pred_color, 'Prediction')]:
+        cv2.putText(panel, text, (5, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                     (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.imwrite(path, np.hstack([gt_color, pred_color]))
+    colorbar = _depth_colorbar(gt_color.shape[0], dmin, dmax)
+    cv2.imwrite(path, np.hstack([input_color, gt_color, pred_color, colorbar]))
 
 
 @torch.no_grad()
@@ -301,7 +344,7 @@ def evaluate(model, loader, device, args, split, save_dir=None, num_vis=0):
 
         if save_dir and (num_vis <= 0 or saved < num_vis):
             save_vis(os.path.join(save_dir, f'{split}_{saved:04d}.png'),
-                     depth, mask, pred, args.dmin, args.dmax, far,
+                     image[0], depth, mask, pred, args.dmin, args.dmax, far,
                      args.far_depth)
             saved += 1
 
@@ -321,6 +364,47 @@ def evaluate(model, loader, device, args, split, save_dir=None, num_vis=0):
 
 def prefixed_metrics(prefix, metrics):
     return {f'{prefix}_{key}': value for key, value in metrics.items()}
+
+
+def run_test(model, checkpoint_path, test_loader, device, args, vis_root,
+             checkpoint_label=None, fallback_epoch=-1, writer=None):
+    """Load one checkpoint, evaluate the test split, and record its results."""
+    if not os.path.isfile(checkpoint_path):
+        raise SystemExit(f'checkpoint not found: {checkpoint_path}')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint_encoder = checkpoint.get('encoder') if isinstance(checkpoint, dict) else None
+    if checkpoint_encoder and checkpoint_encoder != args.encoder:
+        raise SystemExit(f'checkpoint encoder={checkpoint_encoder}, but --encoder={args.encoder}')
+    checkpoint_size = checkpoint.get('img_size') if isinstance(checkpoint, dict) else None
+    if checkpoint_size and int(checkpoint_size) != args.img_size:
+        raise SystemExit(f'checkpoint img_size={checkpoint_size}, but --img-size={args.img_size}')
+    checkpoint_max = checkpoint.get('max_depth') if isinstance(checkpoint, dict) else None
+    if checkpoint_max and float(checkpoint_max) != args.max_depth:
+        raise SystemExit(f'checkpoint max_depth={checkpoint_max}, but --max-depth={args.max_depth}')
+
+    state_dict = checkpoint.get('model', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    model.load_state_dict(_strip_module(state_dict), strict=True)
+    test_start = time.perf_counter()
+    test_metrics, test_frames = evaluate(
+        model, test_loader, device, args, 'test',
+        os.path.join(vis_root, 'test'), args.test_vis_num)
+    best_epoch = (int(checkpoint.get('epoch', fallback_epoch))
+                  if isinstance(checkpoint, dict) else fallback_epoch)
+    test_row = {
+        'checkpoint': checkpoint_label or os.path.abspath(checkpoint_path),
+        'best_epoch': best_epoch,
+        **prefixed_metrics('test', test_metrics),
+        'test_evaluated_frames': test_frames,
+        'test_seconds': time.perf_counter() - test_start,
+    }
+    append_csv(os.path.join(args.save_path, 'test_metrics.csv'), test_row)
+    if writer:
+        for key, value in test_metrics.items():
+            writer.add_scalar(f'test/{key}', value, best_epoch)
+    print(f"[test best epoch={best_epoch}] abs_rel={test_metrics['abs_rel']:.4f} "
+          f"mae={test_metrics['mae']:.3f}m rmse={test_metrics['rmse']:.3f}m "
+          f"d1={test_metrics['d1']:.4f} frames={test_frames}")
+    return test_row
 
 
 # --------------------------------------------------------------------------- #
@@ -359,6 +443,10 @@ def main():
     parser.add_argument('--load-head', action='store_true')
     parser.add_argument('--resume', default=None,
                         help='resume from last.pt (optimizer/scaler state required)')
+    parser.add_argument('--model-training', type=parse_bool, default=True,
+                        help='true: train/validate/test; false: test inference only')
+    parser.add_argument('--checkpoint', default=None,
+                        help='best.pt used when --model-training false')
     # Output / visualization
     parser.add_argument('--save-path', required=True)
     parser.add_argument('--verbose-vis', action='store_true',
@@ -369,8 +457,10 @@ def main():
                         type=int, default=6, help='validation figures to save; 0 means all')
     parser.add_argument('--test-vis-num', type=int, default=0,
                         help='test figures to save after training; 0 means all')
-    parser.add_argument('--dmin', type=float, default=0.2)
-    parser.add_argument('--dmax', type=float, default=20.0)
+    parser.add_argument('--dmin', type=float, default=0.2,
+                        help='shared visualization/colorbar minimum only')
+    parser.add_argument('--dmax', type=float, default=20.0,
+                        help='shared visualization/colorbar maximum only')
     parser.add_argument('--no-tb', action='store_true')
     parser.add_argument('--seed', type=int, default=0)
     args = parser.parse_args()
@@ -382,8 +472,15 @@ def main():
     if args.far_loss_weight < 0:
         parser.error('--far-loss-weight must be non-negative')
     explicit = [args.train_list, args.val_list, args.test_list]
-    if any(explicit) and not all(explicit):
+    if args.model_training and any(explicit) and not all(explicit):
         parser.error('provide all of --train-list, --val-list, and --test-list')
+    if not args.model_training:
+        if not args.test_list:
+            parser.error('--model-training false requires --test-list')
+        if not args.checkpoint:
+            parser.error('--model-training false requires --checkpoint')
+        if args.train_list or args.val_list or args.data:
+            parser.error('--model-training false accepts only --test-list, not training data')
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -399,7 +496,11 @@ def main():
         for name in ('train', 'val', 'test')
     }
 
-    if all(explicit):
+    if not args.model_training:
+        train_files, val_files = [], []
+        test_files = read_list(args.test_list)
+        split_details = {'method': 'test_only_list'}
+    elif all(explicit):
         train_files = read_list(args.train_list)
         val_files = read_list(args.val_list)
         test_files = read_list(args.test_list)
@@ -423,15 +524,18 @@ def main():
             files, args.split_blocks, args.seed)
 
     split_sets = [set(train_files), set(val_files), set(test_files)]
-    if split_sets[0] & split_sets[1] or split_sets[0] & split_sets[2] or split_sets[1] & split_sets[2]:
-        raise SystemExit('train/validation/test lists overlap')
-    if not all(split_sets):
-        raise SystemExit('train, validation, and test splits must all be non-empty')
-
-    if split_details['method'] != 'reused_saved_lists':
-        write_list(train_files, stored_lists['train'])
-        write_list(val_files, stored_lists['val'])
-        write_list(test_files, stored_lists['test'])
+    if args.model_training:
+        if (split_sets[0] & split_sets[1] or split_sets[0] & split_sets[2]
+                or split_sets[1] & split_sets[2]):
+            raise SystemExit('train/validation/test lists overlap')
+        if not all(split_sets):
+            raise SystemExit('train, validation, and test splits must all be non-empty')
+        if split_details['method'] != 'reused_saved_lists':
+            write_list(train_files, stored_lists['train'])
+            write_list(val_files, stored_lists['val'])
+    elif not test_files:
+        raise SystemExit('test split must be non-empty')
+    write_list(test_files, stored_lists['test'])
     train_list = stored_lists['train']
     val_list = stored_lists['val']
     test_list = stored_lists['test']
@@ -446,18 +550,19 @@ def main():
                         max_depth=args.metric_depth_max,
                         sky_as_far=args.sky_as_far,
                         far_depth=args.far_depth)
-    train_ds = FisheyeNPZ(train_list, 'train', **dataset_args)
-    val_ds = FisheyeNPZ(val_list, 'val', **dataset_args)
     # Validation mode is deterministic, so it is also correct for test data.
     test_ds = FisheyeNPZ(test_list, 'val', **dataset_args)
     pin_memory = device == 'cuda'
-    train_loader = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
-                              drop_last=True, num_workers=args.workers,
-                              pin_memory=pin_memory)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
-                            num_workers=args.workers, pin_memory=pin_memory)
     test_loader = DataLoader(test_ds, batch_size=1, shuffle=False,
                              num_workers=args.workers, pin_memory=pin_memory)
+    if args.model_training:
+        train_ds = FisheyeNPZ(train_list, 'train', **dataset_args)
+        val_ds = FisheyeNPZ(val_list, 'val', **dataset_args)
+        train_loader = DataLoader(train_ds, batch_size=args.bs, shuffle=True,
+                                  drop_last=True, num_workers=args.workers,
+                                  pin_memory=pin_memory)
+        val_loader = DataLoader(val_ds, batch_size=1, shuffle=False,
+                                num_workers=args.workers, pin_memory=pin_memory)
     print(f'[data] device={device} encoder={args.encoder} img={args.img_size} '
           f'target={args.target_key}')
 
@@ -466,6 +571,11 @@ def main():
     if args.pretrained_from:
         load_pretrained(model, args.pretrained_from, args.load_head)
     model = model.to(device)
+
+    if not args.model_training:
+        run_test(model, args.checkpoint, test_loader, device, args, vis_root)
+        print(f'done. outputs: {args.save_path}')
+        return
 
     optimizer = AdamW(
         [{'params': [p for n, p in model.named_parameters() if 'pretrained' in n],
@@ -600,31 +710,10 @@ def main():
     if not os.path.isfile(best_path):
         raise SystemExit('no best.pt was produced; validation had no usable frames')
 
-    best_checkpoint = torch.load(best_path, map_location='cpu')
-    model.load_state_dict(_strip_module(best_checkpoint['model']), strict=True)
-    test_start = time.perf_counter()
-    test_metrics, test_frames = evaluate(
-        model, test_loader, device, args, 'test',
-        os.path.join(vis_root, 'test'), args.test_vis_num)
-    test_row = {
-        'checkpoint': 'best.pt',
-        'best_epoch': int(best_checkpoint.get('epoch', best_epoch)),
-        **prefixed_metrics('test', test_metrics),
-        'test_evaluated_frames': test_frames,
-        'test_seconds': time.perf_counter() - test_start,
-    }
-    test_csv = os.path.join(args.save_path, 'test_metrics.csv')
-    # Append if a resumed run is tested again; do not erase prior test records.
-    append_csv(test_csv, test_row)
+    run_test(model, best_path, test_loader, device, args, vis_root,
+             checkpoint_label='best.pt', fallback_epoch=best_epoch, writer=writer)
     if writer:
-        for key, value in test_metrics.items():
-            writer.add_scalar(f'test/{key}', value, best_epoch)
         writer.close()
-
-    print(f"[test best epoch={test_row['best_epoch']}] "
-          f"abs_rel={test_metrics['abs_rel']:.4f} "
-          f"mae={test_metrics['mae']:.3f}m rmse={test_metrics['rmse']:.3f}m "
-          f"d1={test_metrics['d1']:.4f} frames={test_frames}")
     print(f'done. outputs: {args.save_path}')
 
 

@@ -17,6 +17,7 @@ project_root="$(dirname -- "$script_dir")"
 generator_script="$script_dir/make_gt_depthanything_clamp.py"
 python_bin="python3"
 bag_dir="${COMMON_SHARE:+$COMMON_SHARE/bags/nx-2.0/0901}"
+bag_file=""
 out_dir="$project_root/out_data/0901_batch"
 gt_config=""
 max_pairs=""
@@ -31,6 +32,7 @@ usage() {
 Options:
   --bag-dir DIR          Recursively search DIR for .mcap files.
                          Default: $COMMON_SHARE/bags/nx-2.0/0901
+  --bag-file FILE        Process exactly one MCAP instead of searching --bag-dir.
   --gt-config FILE       Required dated GT config.
   --out-dir DIR          Common output root. Default: sml/out_data/0901_batch
   --max-pairs N          Optional successful-output limit for each bag.
@@ -60,6 +62,10 @@ while (($#)); do
   case "$1" in
     --bag-dir)
       bag_dir="${2:?--bag-dir requires a directory}"
+      shift 2
+      ;;
+    --bag-file)
+      bag_file="${2:?--bag-file requires an MCAP file}"
       shift 2
       ;;
     --gt-config)
@@ -103,11 +109,15 @@ while (($#)); do
   esac
 done
 
-if [[ -z "$bag_dir" ]]; then
+if [[ -z "$bag_file" && -z "$bag_dir" ]]; then
   echo "--bag-dir is required when COMMON_SHARE is not set." >&2
   exit 2
 fi
-if [[ ! -d "$bag_dir" ]]; then
+if [[ -n "$bag_file" && ! -f "$bag_file" ]]; then
+  echo "MCAP file does not exist: $bag_file" >&2
+  exit 2
+fi
+if [[ -z "$bag_file" && ! -d "$bag_dir" ]]; then
   echo "Bag directory does not exist: $bag_dir" >&2
   exit 2
 fi
@@ -123,7 +133,12 @@ if [[ ! -f "$generator_script" ]]; then
   echo "Clamp GT generator does not exist: $generator_script" >&2
   exit 2
 fi
-bag_dir="$(realpath -- "$bag_dir")"
+if [[ -n "$bag_file" ]]; then
+  bag_file="$(realpath -- "$bag_file")"
+  bag_dir="$(dirname -- "$bag_file")"
+else
+  bag_dir="$(realpath -- "$bag_dir")"
+fi
 gt_config="$(realpath -- "$gt_config")"
 out_dir="$(realpath -m -- "$out_dir")"
 if ! command -v "$python_bin" >/dev/null 2>&1; then
@@ -139,7 +154,11 @@ if [[ -n "$frame_interval" && ! "$frame_interval" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-mapfile -d '' mcap_files < <(find "$bag_dir" -type f -name '*.mcap' -print0 | sort -z)
+if [[ -n "$bag_file" ]]; then
+  mcap_files=("$bag_file")
+else
+  mapfile -d '' mcap_files < <(find "$bag_dir" -type f -name '*.mcap' -print0 | sort -z)
+fi
 if ((${#mcap_files[@]} == 0)); then
   echo "No .mcap files found under: $bag_dir" >&2
   exit 1
@@ -212,6 +231,12 @@ make_session_label() {
   REPLY="${raw//[^A-Za-z0-9_-]/_}"
 }
 
+encode_manifest_field() {
+  local value="$1"
+  value="${value//%/%25}"
+  REPLY="${value//,/%2C}"
+}
+
 success=0
 failed=0
 skipped=0
@@ -219,25 +244,25 @@ skipped=0
 for bag_path in "${mcap_files[@]}"; do
   bag_path="$(realpath -- "$bag_path")"
   relative_path="${bag_path#"$bag_dir"/}"
-  if [[ "$relative_path" == *','* || "$bag_path" == *','* ]]; then
-    echo "[FAILED] Commas in paths are not supported by bag_manifest.csv: $bag_path" >&2
-    ((failed += 1))
-    continue
-  fi
+  encode_manifest_field "$bag_path"
+  manifest_path_key="$REPLY"
 
-  if [[ -n "${manifest_number[$bag_path]+set}" ]]; then
-    bag_number="${manifest_number[$bag_path]}"
-    output_prefix="${manifest_prefix[$bag_path]}"
+  if [[ -n "${manifest_number[$manifest_path_key]+set}" ]]; then
+    bag_number="${manifest_number[$manifest_path_key]}"
+    output_prefix="${manifest_prefix[$manifest_path_key]}"
   else
     printf -v bag_number '%02d' "$next_number"
     ((next_number += 1))
     make_session_label "$bag_path"
     output_prefix="${REPLY}_bag${bag_number}"
-    manifest_number["$bag_path"]="$bag_number"
-    manifest_prefix["$bag_path"]="$output_prefix"
+    manifest_number["$manifest_path_key"]="$bag_number"
+    manifest_prefix["$manifest_path_key"]="$output_prefix"
     if ((dry_run == 0)); then
+      encode_manifest_field "$relative_path"
+      manifest_relative_path="$REPLY"
       printf '%s,%s,%s,%s\n' \
-        "$bag_number" "$output_prefix" "$relative_path" "$bag_path" >> "$manifest_path"
+        "$bag_number" "$output_prefix" "$manifest_relative_path" \
+        "$manifest_path_key" >> "$manifest_path"
     fi
   fi
 
