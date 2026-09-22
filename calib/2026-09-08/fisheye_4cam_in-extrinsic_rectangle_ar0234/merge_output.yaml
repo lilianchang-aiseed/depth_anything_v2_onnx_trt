@@ -1,0 +1,11 @@
+output_bags:
+  - uri: /home/lilian/files/data/flight_data_2026_09_08_merged_
+    storage_id: mcap
+    all_topics: true
+
+
+# Usage:
+# ros2 bag convert \
+#   --input /home/lilian/files/data/flight_data_2026_09_04-19_09_13/flight_data_2026_09_04-19_09_13_0.mcap \
+#   --input /home/lilian/files/data/flight_data_2026_09_04-19_13_33/flight_data_2026_09_04-19_13_33_0.mcap \
+#   --output-options merge_output.yaml

@@ -1,0 +1,56 @@
+# Complete input configuration for train_fisheye_with_test.py.
+# Relative paths are resolved from this file's directory. CLI values override YAML.
+
+data: /home/share/lilian/data/nx-2.0_5-affine/dataset
+train_list: null
+val_list: null
+test_list: null
+split_blocks: 10
+target_key: depth_aligned
+# input_mode: mono, color
+input_mode: color 
+sky_as_far: true
+
+encoder: vits
+# dpt: current default; dpt-custom: experimental dpt_custom.py implementation.
+model_architecture: dpt
+img_size: 322
+min_depth: 0.2
+metric_depth_max: 15.0
+far_depth: 19.0
+max_depth: 20.0
+
+loss: range-weighted-silog
+far_loss_weight: 0.05
+silog_0_2_weight: 0.45
+silog_2_5_weight: 0.25
+silog_5_10_weight: 0.2
+silog_10_20_weight: 0.05
+
+epochs: 60
+bs: 4
+lr: 5.0e-6
+workers: 4
+amp: true
+
+pretrained_from: ../checkpoints/depth_anything_v2_vits.pth
+load_head: true
+resume: null
+model_training: true
+checkpoint: null
+
+# Optional official VKITTI baseline. When false, the checkpoint and the
+# separate official model module are neither checked nor loaded.
+compare_vkitti: false
+vkitti_checkpoint: null
+
+save_path: runs/fisheye_vits_20260921_1940
+verbose_vis: false
+vis_epoch_interval: 5
+valid_vis_num: 6
+test_vis_num: 100
+test_representative_min_pixels: 100
+dmin: 0.2
+dmax: 20.0
+no_tb: false
+seed: 0

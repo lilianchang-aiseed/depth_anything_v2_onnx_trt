@@ -44,7 +44,7 @@ def load_yaml(path):
     return yaml.safe_load(text)
 
 
-def build_transforms(root):
+def build_transforms(root, devices):
     calib = root / "calib/rect_4cam_imu_in-extinsic"
     left_cfg = load_yaml(
         calib / "cam2imu/flight_data_2026_08_04-18_11_04_1-camchain-imucam.yaml"
@@ -53,20 +53,26 @@ def build_transforms(root):
         calib / "cam2realsense2imu/rs_d455_cube-imu_calib/"
         "flight_data_2026_08_27-10_27_07_0-camchain-imucam.yaml"
     )
-    pair_cfg = load_yaml(
-        root / "calib/rs_2cam_in-extrinsic/"
-        "flight_data_2026_08_27-10_27_07_0-camchain.yaml"
-    )
     t_left_imu = np.asarray(left_cfg["cam0"]["T_cam_imu"], np.float64)
     t_i455_imu = np.asarray(d455_cfg["cam0"]["T_cam_imu"], np.float64)
-    t_i435_i455 = np.asarray(pair_cfg["cam1"]["T_cn_cnm1"], np.float64)
     t_left_i455 = t_left_imu @ np.linalg.inv(t_i455_imu)
-    t_left_i435 = t_left_i455 @ np.linalg.inv(t_i435_i455)
-    return t_left_i455, t_left_i435
+    result = {}
+    if "d455" in devices:
+        result["d455"] = t_left_i455
+    if "d435" in devices:
+        pair_cfg = load_yaml(
+            root / "calib/rs_2cam_in-extrinsic/"
+            "flight_data_2026_08_27-10_27_07_0-camchain.yaml"
+        )
+        t_i435_i455 = np.asarray(
+            pair_cfg["cam1"]["T_cn_cnm1"], np.float64)
+        result["d435"] = t_left_i455 @ np.linalg.inv(t_i435_i455)
+    return result
 
 
-def read_intrinsics(bag):
-    wanted = {D455_INFO, D435_INFO}
+def read_intrinsics(bag, devices):
+    topic_for = {"d455": D455_INFO, "d435": D435_INFO}
+    wanted = {topic_for[device] for device in devices}
     result = {}
     with AnyReader([bag], default_typestore=TYPESTORE) as reader:
         conns = [c for c in reader.connections if c.topic in wanted]
@@ -79,7 +85,36 @@ def read_intrinsics(bag):
     missing = wanted.difference(result)
     if missing:
         raise RuntimeError(f"Missing CameraInfo topics: {sorted(missing)}")
-    return result[D455_INFO], result[D435_INFO]
+    return {device: result[topic_for[device]] for device in devices}
+
+
+def bag_topics(bag):
+    with AnyReader([bag], default_typestore=TYPESTORE) as reader:
+        return {connection.topic for connection in reader.connections}
+
+
+def select_devices(bag, requested):
+    topics = bag_topics(bag)
+    available = {
+        device for device, depth_topic, info_topic in (
+            ("d455", D455_DEPTH, D455_INFO),
+            ("d435", D435_DEPTH, D435_INFO),
+        ) if depth_topic in topics and info_topic in topics
+    }
+    if requested == "auto":
+        selected = available
+    elif requested == "both":
+        selected = {"d455", "d435"}
+    else:
+        selected = {requested}
+    missing = selected - available
+    if missing:
+        raise SystemExit(
+            f"Requested RealSense source(s) unavailable in bag: {sorted(missing)}; "
+            f"available={sorted(available)}")
+    if not selected:
+        raise SystemExit("Bag has neither a complete D455 nor D435 depth/CameraInfo pair")
+    return tuple(device for device in ("d455", "d435") if device in selected)
 
 
 def depth_color(depth, dmin, dmax):
@@ -123,8 +158,12 @@ def make_montage(sample, d455, d435, dt455, dt435, alpha, dmin, dmax):
     if left.ndim == 2:
         left = cv2.cvtColor(left, cv2.COLOR_GRAY2BGR)
     da = np.asarray(sample["depth_aligned"], np.float32)
-    c455, v455 = depth_color(d455, dmin, dmax)
-    c435, v435 = depth_color(d435, dmin, dmax)
+    blank = np.zeros_like(left)
+    empty = np.zeros(left.shape[:2], dtype=bool)
+    c455, v455 = (depth_color(d455, dmin, dmax)
+                  if d455 is not None else (blank, empty))
+    c435, v435 = (depth_color(d435, dmin, dmax)
+                  if d435 is not None else (blank, empty))
     cda, vda = depth_color(da, dmin, dmax)
     stamp = float(sample["stamp"])
 
@@ -132,9 +171,11 @@ def make_montage(sample, d455, d435, dt455, dt435, alpha, dmin, dmax):
     row1 = [
         tile(left, "Stereo-left RGB", f"stamp={stamp:.6f}"),
         tile(blend(left, c455, v455, alpha), "D455 depth + RGB",
-             f"alpha={alpha:.2f}, dt={dt455 * 1e3:+.1f} ms"),
+             (f"alpha={alpha:.2f}, dt={dt455 * 1e3:+.1f} ms"
+              if d455 is not None else "unavailable")),
         tile(blend(left, c435, v435, alpha), "D435 depth + RGB",
-             f"alpha={alpha:.2f}, dt={dt435 * 1e3:+.1f} ms"),
+             (f"alpha={alpha:.2f}, dt={dt435 * 1e3:+.1f} ms"
+              if d435 is not None else "unavailable")),
         tile(blend(left, cda, vda, alpha), "Aligned DA-V2 + RGB",
              f"shared scale={dmin:g}-{dmax:g} m"),
     ]
@@ -152,10 +193,10 @@ def make_montage(sample, d455, d435, dt455, dt435, alpha, dmin, dmax):
 
 
 def stream_project(bag, targets, stems, cache, intrinsics, transforms, tol):
-    topics = {D455_DEPTH: "d455", D435_DEPTH: "d435"}
+    depth_topic_for = {"d455": D455_DEPTH, "d435": D435_DEPTH}
+    topics = {depth_topic_for[device]: device for device in intrinsics}
     states = {topic: {"index": 0, "prev": None} for topic in topics}
-    dt = {"d455": np.full(len(targets), np.nan),
-          "d435": np.full(len(targets), np.nan)}
+    dt = {device: np.full(len(targets), np.nan) for device in intrinsics}
 
     def save_match(topic, index, item):
         if item is None:
@@ -212,6 +253,10 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.45)
     ap.add_argument("--depth-min", type=float, default=0.2)
     ap.add_argument("--depth-max", type=float, default=15.0)
+    ap.add_argument(
+        "--realsense", choices=("auto", "both", "d455", "d435"),
+        default="auto",
+        help="RealSense source to use; auto uses every complete source in the bag")
     args = ap.parse_args()
     if not 0.0 <= args.alpha <= 1.0:
         raise SystemExit("--alpha must be between 0 and 1")
@@ -224,9 +269,11 @@ def main():
     if not files:
         raise SystemExit(f"No samples found in {data_dir}")
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    devices = select_devices(bag, args.realsense)
+    print(f"RealSense source(s): {', '.join(devices)}")
     cache = args.out_dir / "aligned_depth_cache"
-    (cache / "d455").mkdir(parents=True, exist_ok=True)
-    (cache / "d435").mkdir(parents=True, exist_ok=True)
+    for device in devices:
+        (cache / device).mkdir(parents=True, exist_ok=True)
 
     targets, stems = [], []
     for path in files:
@@ -235,28 +282,31 @@ def main():
         stems.append(path.stem)
     targets = np.asarray(targets, np.float64)
 
-    k455, k435 = read_intrinsics(bag)
-    t455, t435 = build_transforms(args.root)
-    print(f"D455 K={tuple(round(x, 3) for x in k455)}")
-    print(f"D435 K={tuple(round(x, 3) for x in k435)}")
-    print(f"T_L<-I455 t={np.round(t455[:3, 3], 4)}")
-    print(f"T_L<-I435 t={np.round(t435[:3, 3], 4)}")
+    intrinsics = read_intrinsics(bag, devices)
+    transforms = build_transforms(args.root, devices)
+    for device in devices:
+        print(f"{device.upper()} K={tuple(round(x, 3) for x in intrinsics[device])}")
+        print(f"T_L<-{device.upper()} t="
+              f"{np.round(transforms[device][:3, 3], 4)}")
     dt = stream_project(
-        bag, targets, stems, cache,
-        {"d455": k455, "d435": k435}, {"d455": t455, "d435": t435},
-        args.sync_tol,
+        bag, targets, stems, cache, intrinsics, transforms, args.sync_tol,
     )
 
     written = 0
     for i, path in enumerate(files):
-        p455 = cache / "d455" / f"{path.stem}.npy"
-        p435 = cache / "d435" / f"{path.stem}.npy"
-        if not p455.is_file() or not p435.is_file():
-            print(f"Skip {path.stem}: no synchronized RealSense pair")
+        projected = {
+            device: cache / device / f"{path.stem}.npy" for device in devices
+        }
+        if any(not projected[device].is_file() for device in devices):
+            print(f"Skip {path.stem}: no synchronized selected RealSense depth")
             continue
+        d455 = np.load(projected["d455"]) if "d455" in projected else None
+        d435 = np.load(projected["d435"]) if "d435" in projected else None
         with np.load(path, allow_pickle=False) as sample:
             montage = make_montage(
-                sample, np.load(p455), np.load(p435), dt["d455"][i], dt["d435"][i],
+                sample, d455, d435,
+                dt.get("d455", np.full(len(files), np.nan))[i],
+                dt.get("d435", np.full(len(files), np.nan))[i],
                 args.alpha, args.depth_min, args.depth_max,
             )
         output = args.out_dir / f"{path.stem}.jpg"

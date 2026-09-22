@@ -100,10 +100,14 @@ class FisheyeNPZ(Dataset):
         image = self._load_image(z["left"])
         key = self.target_key if self.target_key in z.files else self.fallback_key
         depth = np.asarray(z[key], dtype=np.float32).copy()
+        # Preserve the complete stored GT for validation/test visualization.
+        # Loss masking below must not erase far/sky labels from the displayed GT.
+        display_depth = depth.copy()
         explicit_far = key == "depth_aligned" and "far_mask" in z.files
         separate_far = explicit_far or self.far_depth is not None
         far_mask = (np.asarray(z["far_mask"], dtype=bool).copy()
                     if explicit_far else np.zeros(depth.shape, dtype=bool))
+        stored_metric_mask = None
 
         invalid = ~np.isfinite(depth) | (depth <= 0)
         invalid |= (depth < self.min_depth) | (depth > self.max_depth)
@@ -111,7 +115,8 @@ class FisheyeNPZ(Dataset):
             mask_key = ("metric_valid_mask" if "metric_valid_mask" in z.files
                         else "valid_mask" if "valid_mask" in z.files else None)
             if mask_key:
-                invalid |= ~z[mask_key].astype(bool)
+                stored_metric_mask = z[mask_key].astype(bool)
+                invalid |= ~stored_metric_mask
 
         if self.sky_as_far and "sky_mask" in z.files:
             sky = z["sky_mask"].astype(bool)
@@ -143,5 +148,17 @@ class FisheyeNPZ(Dataset):
         sample["far_mask"] = torch.from_numpy(sample.pop("mask") > 0.5)
         sample["valid_mask"] = (torch.isnan(sample["depth"]) == 0)
         sample["depth"][sample["valid_mask"] == 0] = 0
+        if self.mode == "val":
+            sample["display_depth"] = torch.from_numpy(display_depth)
+            # Full-label evaluation uses this to reject FOV/wing/background
+            # holes while retaining exact metric, far, and sky supervision.
+            if stored_metric_mask is None:
+                display_valid = np.isfinite(display_depth) & (display_depth > 0)
+            else:
+                display_valid = stored_metric_mask | far_mask
+                if "sky_mask" in z.files:
+                    display_valid |= z["sky_mask"].astype(bool)
+                display_valid &= np.isfinite(display_depth) & (display_depth > 0)
+            sample["display_valid_mask"] = torch.from_numpy(display_valid)
         sample["image_path"] = path
         return sample

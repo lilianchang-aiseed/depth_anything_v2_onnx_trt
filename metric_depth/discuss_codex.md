@@ -310,7 +310,7 @@ hide absolute metric-scale errors.
 Future implementation should primarily modify:
 
 ```text
-metric_depth/depth_anything_v2/dpt.py
+metric_depth/model_metric_depth/dpt.py
 metric_depth/train_fisheye_with_test.py
 ```
 

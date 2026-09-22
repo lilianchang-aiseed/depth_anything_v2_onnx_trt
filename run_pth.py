@@ -9,7 +9,7 @@ import torch
 from depth_anything_v2.dpt import (
     DepthAnythingV2 as RelativeDepthAnythingV2,
 )
-from metric_depth.depth_anything_v2.dpt import (
+from metric_depth.model_metric_depth.dpt import (
     DepthAnythingV2 as MetricDepthAnythingV2,
 )
 from frame_mask_utils import parse_bool, prepare_frame

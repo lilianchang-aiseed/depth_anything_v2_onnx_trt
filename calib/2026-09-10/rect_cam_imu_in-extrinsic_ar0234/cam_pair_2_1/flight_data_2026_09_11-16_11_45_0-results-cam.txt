@@ -1,0 +1,21 @@
+Calibration results 
+====================
+Camera-system parameters:
+cam0 (/stereo_2_1/left/image_rect):
+    type: <class 'aslam_cv.libaslam_cv_python.DistortedPinholeCameraGeometry'>
+    distortion: [ 0.00413993 -0.00448315  0.0010549   0.00402119] +- [0.01101842 0.00896499 0.00304465 0.00260507]
+    projection: [159.52102968 158.38158813 160.10793182 160.54383437] +- [3.0191903  2.92444861 1.71766197 1.96245867]
+    reprojection error: [-0.000002, 0.000002] +- [0.144208, 0.095515]
+
+
+
+Target configuration
+====================
+
+  Type: checkerboard
+  Rows
+    Count: 8
+    Distance: 0.02 [m]
+  Cols
+    Count: 11
+    Distance: 0.02 [m]

@@ -1,0 +1,30 @@
+# Offline raw-camera to rectified-camera bag conversion.
+# Relative paths are resolved from this YAML file.
+calibration: ../../calib/2026-09-16/stereo_calib_ds-camchain_ar0234.yaml
+
+# These match metric_depth/infer_fisheye_rosbag.py. The 90-degree full FOV is
+# represented below as its 45-degree half-angle and produces a circular valid
+# region with black square corners.
+output_width: 322
+output_height: 322
+half_angle_deg: 45.0
+
+# The cam0/cam1 names inside every calibration pair are pair-local. The
+# physical camera number comes from the cam_pair_<left>_<right> key below.
+cameras:
+  0:
+    input_topic: /camera_0/image_raw
+    output_topic: /camera_0/image_rect
+    calibration_pair: cam_pair_0_3
+  1:
+    input_topic: /camera_1/image_raw
+    output_topic: /camera_1/image_rect
+    calibration_pair: cam_pair_1_0
+  2:
+    input_topic: /camera_2/image_raw
+    output_topic: /camera_2/image_rect
+    calibration_pair: cam_pair_2_1
+  3:
+    input_topic: /camera_3/image_raw
+    output_topic: /camera_3/image_rect
+    calibration_pair: cam_pair_3_2

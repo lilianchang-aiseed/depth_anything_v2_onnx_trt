@@ -34,16 +34,16 @@ import csv
 import os
 import re
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
 from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 
-try:
-    from .correct_matrix_direction import load_d455_d435, load_left_d455
-except ImportError:  # direct execution: python3 sml/make_gt/make_gt_depthanything.py
-    from correct_matrix_direction import load_d455_d435, load_left_d455
+ML_GT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ML_GT_ROOT))
+from tools.correct_matrix_direction import load_d455_d435, load_left_d455
 
 TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
 # --------------------------------------------------------------------------- #

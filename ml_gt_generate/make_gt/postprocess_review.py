@@ -2,6 +2,7 @@
 """Move low-quality GT NPZ/PNG pairs into _review without deleting data.
 
 By default this is a dry run. Add --apply after inspecting the printed list.
+MAE filtering is disabled unless at least one --mae-*-max option is supplied.
 
 Usage:
 dry-run: 
@@ -15,9 +16,7 @@ python3 ml_gt_generate/make_gt/postprocess_review.py \
   --mae-0-2-max 1 \
   --mae-2-5-max 2 \
   --mae-rule both \
-  --dirty-before 0827_train_1_0_20260827_164533_bag01=140 \
-  --dirty-before 0827_train_1_0_20260827_170239_bag02=174 \
-  --dirty-before 0901_train_2_1_20260901_155219_bag07=15
+  --dirty-interval ml_gt_generate/make_gt/dirty_data_nx2.0_5-affine.yaml
 ```
 
 apply: 
@@ -27,9 +26,7 @@ python3 ml_gt_generate/make_gt/postprocess_review.py \
   --mae-0-2-max 1 \
   --mae-2-5-max 2 \
   --mae-rule both \
-  --dirty-before 0827_train_1_0_20260827_164533_bag01=140 \
-  --dirty-before 0827_train_1_0_20260827_170239_bag02=174 \
-  --dirty-before 0901_train_2_1_20260901_155219_bag07=15 \
+  --dirty-interval ml_gt_generate/make_gt/dirty_data_nx2.0_5-affine.yaml \
   --apply
 ```
 
@@ -45,6 +42,11 @@ try:
 except ImportError as error:
     raise SystemExit("natsort is required: pip install natsort") from error
 
+try:
+    import yaml
+except ImportError as error:
+    raise SystemExit("PyYAML is required: pip install pyyaml") from error
+
 
 def finite_float(value):
     try:
@@ -54,17 +56,52 @@ def finite_float(value):
     return number if math.isfinite(number) else None
 
 
-def parse_dirty_rule(text):
+def load_dirty_intervals(path):
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise ValueError(f"dirty-interval YAML does not exist: {path}")
     try:
-        prefix, limit = text.rsplit("=", 1)
-        limit = int(limit)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "expected PREFIX=FIRST_CLEAN_FRAME, for example session_bag01=140"
-        ) from error
-    if not prefix or limit < 1:
-        raise argparse.ArgumentTypeError("prefix must be non-empty and frame >= 1")
-    return prefix, limit
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as error:
+        raise ValueError(f"invalid dirty-interval YAML {path}: {error}") from error
+    if document is None:
+        return {}
+    if not isinstance(document, dict) or set(document) != {"dirty_intervals"}:
+        raise ValueError(
+            "dirty-interval YAML must contain exactly one mapping named "
+            "dirty_intervals")
+    rules = document["dirty_intervals"]
+    if not isinstance(rules, dict):
+        raise ValueError("dirty_intervals must map each prefix to a list of ranges")
+
+    normalized = {}
+    for prefix, intervals in rules.items():
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError("dirty-interval prefix must be a non-empty string")
+        if not isinstance(intervals, list):
+            raise ValueError(f"dirty intervals for {prefix!r} must be a list")
+        normalized_intervals = []
+        for interval in intervals:
+            if not isinstance(interval, list) or len(interval) != 2:
+                raise ValueError(
+                    f"dirty interval for {prefix!r} must be [FIRST_FRAME, LAST_FRAME]")
+            first, last = interval
+            if (isinstance(first, bool) or isinstance(last, bool)
+                    or not isinstance(first, int) or not isinstance(last, int)
+                    or first < 1 or last < first):
+                raise ValueError(
+                    f"dirty interval for {prefix!r} must satisfy "
+                    "1 <= FIRST_FRAME <= LAST_FRAME")
+            normalized_intervals.append((first, last))
+        normalized_intervals.sort()
+        for previous, current in zip(normalized_intervals,
+                                     normalized_intervals[1:]):
+            if current[0] <= previous[1]:
+                raise ValueError(
+                    f"dirty intervals overlap for {prefix!r}: "
+                    f"{previous} and {current}")
+        normalized[prefix] = normalized_intervals
+    return normalized
 
 
 def main():
@@ -72,14 +109,18 @@ def main():
         description="Move rejected dataset/visualization pairs into _review")
     parser.add_argument("--out-dir", required=True,
                         help="batch root containing dataset, vis, and statistics")
-    parser.add_argument("--mae-0-2-max", type=float, default=1.0)
-    parser.add_argument("--mae-2-5-max", type=float, default=2.0)
-    parser.add_argument("--mae-rule", choices=("both", "either"), default="both",
-                        help="both: require both MAEs to exceed limits (default)")
     parser.add_argument(
-        "--dirty-before", action="append", type=parse_dirty_rule, default=[],
-        metavar="PREFIX=FIRST_CLEAN_FRAME",
-        help="review frames below the limit; may be supplied multiple times")
+        "--mae-0-2-max", type=float,
+        help="optional 0-2 m MAE limit; omitted means this range is not checked")
+    parser.add_argument(
+        "--mae-2-5-max", type=float,
+        help="optional 2-5 m MAE limit; omitted means this range is not checked")
+    parser.add_argument(
+        "--mae-rule", choices=("both", "either"), default="both",
+        help="combine only the MAE limits supplied on the command line")
+    parser.add_argument(
+        "--dirty-interval", type=Path, metavar="YAML",
+        help="YAML file mapping prefixes to inclusive dirty frame intervals")
     parser.add_argument("--apply", action="store_true",
                         help="perform moves; without this flag only preview")
     args = parser.parse_args()
@@ -93,7 +134,11 @@ def main():
     if not csv_files:
         parser.error(f"no per-bag CSV files found in {statistics_dir}")
 
-    dirty_limits = dict(args.dirty_before)
+    try:
+        dirty_intervals = (load_dirty_intervals(args.dirty_interval)
+                           if args.dirty_interval else {})
+    except ValueError as error:
+        parser.error(str(error))
     decisions = {}
     for csv_path in csv_files:
         prefix = csv_path.stem
@@ -104,22 +149,35 @@ def main():
                 except (KeyError, TypeError, ValueError):
                     raise SystemExit(f"invalid frame column in {csv_path}")
                 reasons = []
-                if prefix in dirty_limits and frame < dirty_limits[prefix]:
-                    reasons.append(f"manual_dirty_before_{dirty_limits[prefix]}")
+                for first, last in dirty_intervals.get(prefix, ()):
+                    if first <= frame <= last:
+                        reasons.append(f"manual_dirty_interval_{first}_{last}")
+                        break
 
-                mae02 = finite_float(row.get("val_MAE_0_2m"))
-                mae25 = finite_float(row.get("val_MAE_2_5m"))
-                failed02 = mae02 is not None and mae02 > args.mae_0_2_max
-                failed25 = mae25 is not None and mae25 > args.mae_2_5_max
-                failed_mae = ((failed02 and failed25) if args.mae_rule == "both"
-                              else (failed02 or failed25))
+                mae_checks = []
+                if args.mae_0_2_max is not None:
+                    mae_checks.append((
+                        "mae_0_2", finite_float(row.get("val_MAE_0_2m")),
+                        args.mae_0_2_max))
+                if args.mae_2_5_max is not None:
+                    mae_checks.append((
+                        "mae_2_5", finite_float(row.get("val_MAE_2_5m")),
+                        args.mae_2_5_max))
+                mae_failures = [
+                    (name, value, limit) for name, value, limit in mae_checks
+                    if value is not None and value > limit
+                ]
+                failed_mae = bool(mae_checks) and (
+                    len(mae_failures) == len(mae_checks)
+                    if args.mae_rule == "both" else bool(mae_failures))
                 if failed_mae:
-                    reasons.append(
-                        f"mae_0_2={mae02:.3f},mae_2_5={mae25:.3f}")
+                    reasons.append(",".join(
+                        f"{name}={value:.3f}>{limit:g}"
+                        for name, value, limit in mae_failures))
                 if reasons:
                     decisions[f"{prefix}_{frame}"] = reasons
 
-    for prefix in dirty_limits:
+    for prefix in dirty_intervals:
         if not any(path.stem == prefix for path in csv_files):
             raise SystemExit(f"dirty prefix has no matching statistics CSV: {prefix}")
 

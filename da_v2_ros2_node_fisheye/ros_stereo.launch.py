@@ -19,12 +19,14 @@ from launch.substitutions import LaunchConfiguration
 
 
 HERE = Path(__file__).resolve().parent
-NODE_SCRIPT = HERE / "depth_anything_v2_trt_node.py"
+NODE_SCRIPT = HERE / "depth_anything_v2_trt_node-v3.py"
 DEFAULT_PYTHON = Path.home() / "stereo_venv" / "bin" / "python3"
 DEFAULT_ENGINE = (
-    HERE.parent / "checkpoints" / "depth_anything_v2_vits_dynamic.engine"
-)
+    # HERE.parent / "checkpoints" / "depth_anything_v2_vits_dynamic.engine"
+    #HERE.parent / "checkpoints" / "depth_anything_v2_vits_b4_420x280.engine"
 
+    HERE.parent / "checkpoints" / "best-0910_b4_420x280_fp16.engine"
+)
 
 def generate_launch_description() -> LaunchDescription:
     python_executable = LaunchConfiguration("python_executable")

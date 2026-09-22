@@ -31,7 +31,7 @@ D455_D435_CALIB = (
 )
 sys.path.insert(0, str(ML_GT_ROOT))
 
-from make_gt.correct_matrix_direction import load_d455_d435, load_left_d455  # noqa: E402
+from tools.correct_matrix_direction import load_d455_d435, load_left_d455  # noqa: E402
 
 
 def load_yaml(path):

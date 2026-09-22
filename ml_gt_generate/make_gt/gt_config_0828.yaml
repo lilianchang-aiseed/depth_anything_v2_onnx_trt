@@ -18,29 +18,33 @@ topics:
 
 calibration:
   # Unmodified outputs copied directly from Kalibr.
-  left_d455: ../calib/2026-08-28/stereo_d455_d435_extrinsic/d455-left/flight_data_2026_08_31-12_42_27_0-camchain.yaml
-  d455_d435: ../calib/2026-08-28/stereo_d455_d435_extrinsic/d455-d435/flight_data_2026_08_31-12_28_13_0-camchain.yaml
+  left_d455: ../../calib/2026-08-28/stereo_d455_d435_extrinsic/d455-left/flight_data_2026_08_31-12_42_27_0-camchain.yaml
+  d455_d435: ../../calib/2026-08-28/stereo_d455_d435_extrinsic/d455-d435/flight_data_2026_08_31-12_28_13_0-camchain.yaml
   d455_depth_scale: 0.001
   d435_depth_scale: 0.001
   d435_source: kalibr_infra1
 
 mask:
-  # null uses the whole target image. Set a .npy circle mask when available.
-  deploy_mask: ../masks/pair_1_0_circle_fov.npy
+  # "auto" maps /stereo_L_R/left/image_rect to masks/pair_L_R_circle_fov.npy.
+  deploy_mask: auto
 
 runtime:
   sync_tol: 0.05
   depth_time_offset: 0.0
   d435_time_offset: 0.0
   dmin: 0.2
-  dmax: 15.0
-  max_fit_depth: 30.0
-  gt_max_depth: 20.0
+  dmax: 20.0
+  max_fit_depth: 20.0
+  metric_depth_max: 20.0
+  far_depth: 19.0
+  sky_depth: 20.0
+  model_max_depth: 20.0
   splat: true
-  d435_merge: fill
-  fit_samples: 10000
+  d435_merge: min
+  fit_mode: weighted-mse
+  fit_samples: 15000
   near_sample_weight: 3.0
-  ransac_validation_ratio: 0.2
+  ransac_validation_ratio: 0.05
 
 da:
   model: depth-anything/Depth-Anything-V2-Small-hf
@@ -52,9 +56,10 @@ sky:
   bin: ../EGE_165.ncnn.bin
   size: 384
   input_name: in0
-  output_name: out0
-  mean: [123.675, 116.28, 103.53]
-  norm: [0.01712, 0.01751, 0.01743]
+  output_name: out5
+  mean: [117.790845, 117.790845, 117.790845]
+  norm: [0.015580003, 0.015580003, 0.015580003]
+  dynamic_input_scale: true
   apply_sigmoid: false
   threshold: 0.5
   invert: false

@@ -100,6 +100,7 @@ def weighted_mse_affine_invdepth(rel, inv_gt, valid, ransac_iters=200,
     best_s, best_t = None, None
     best_mse = np.inf
     candidate_count = 0
+    candidates = []
     for _ in range(int(ransac_iters)):
         i, j = rng.integers(0, len(x), size=2)
         if i == j or abs(x[i] - x[j]) < 1e-9:
@@ -111,12 +112,18 @@ def weighted_mse_affine_invdepth(rel, inv_gt, valid, ransac_iters=200,
         prediction = s * x + t
         mse = float(np.sum(weights * (prediction - y) ** 2) / weight_sum)
         candidate_count += 1
+        candidates.append((mse, float(s), float(t)))
         if mse < best_mse:
             best_s, best_t, best_mse = float(s), float(t), mse
 
     if best_s is None:
         return None
-    return best_s, best_t, best_mse, candidate_count, int(len(x))
+    top_candidates = [
+        {"s": slope, "t": shift, "mse": mse}
+        for mse, slope, shift in sorted(candidates)[:5]
+    ]
+    return (best_s, best_t, best_mse, candidate_count, int(len(x)),
+            top_candidates)
 
 
 def _pava_increasing(values, weights):
@@ -358,7 +365,8 @@ def step3_fit_metric_L(da_L, rs_depth_L, anchor_valid,
         )
         if fit is None:
             return None, {}
-        s, t, weighted_mse, candidate_count, fit_sample_count = fit
+        (s, t, weighted_mse, candidate_count, fit_sample_count,
+         fit_candidates) = fit
         ga_inv = s * da_L + t
         da_far_threshold = (
             (1.0 / metric_depth_max - t) / s
@@ -373,6 +381,7 @@ def step3_fit_metric_L(da_L, rs_depth_L, anchor_valid,
             "fit_sample_count": fit_sample_count,
             "weighted_invdepth_mse": weighted_mse,
             "candidate_count": candidate_count,
+            "fit_candidates": fit_candidates,
             "near_depth": 5.0,
             "near_weight": float(near_sample_weight),
             "da_far_threshold": float(da_far_threshold),

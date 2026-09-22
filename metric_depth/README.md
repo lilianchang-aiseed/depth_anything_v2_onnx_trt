@@ -34,7 +34,7 @@ Download the checkpoints listed [here](#pre-trained-models) and put them under t
 import cv2
 import torch
 
-from depth_anything_v2.dpt import DepthAnythingV2
+from model_metric_depth.dpt import DepthAnythingV2
 
 model_configs = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -72,16 +72,6 @@ python run.py \
   --load-from checkpoints/depth_anything_v2_metric_vkitti_vitl.pth \
   --max-depth 80 \
   --img-path <path> --outdir <outdir> [--input-size <size>] [--save-numpy]
-```
-
-### Project 2D images to point clouds:
-
-```bash
-python depth_to_pointcloud.py \
-  --encoder vitl \
-  --load-from checkpoints/depth_anything_v2_metric_hypersim_vitl.pth \
-  --max-depth 20 \
-  --img-path <path> --outdir <outdir>
 ```
 
 ### Reproduce training

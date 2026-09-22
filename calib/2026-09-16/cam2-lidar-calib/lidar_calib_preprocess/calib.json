@@ -1,0 +1,47 @@
+{
+  "camera": {
+    "camera_model": "plumb_bob",
+    "distortion_coeffs": [
+      -0.0449,
+      0.0271,
+      -0.00124,
+      -0.01193
+    ],
+    "intrinsics": [
+      198.9072,
+      194.2689,
+      121.4513,
+      139.7931
+    ]
+  },
+  "meta": {
+    "bag_names": [
+      "flight_data_2026_09_21-16_13_00_0.mcap"
+    ],
+    "camera_info_topic": "",
+    "data_path": "/files/data/flight_data_2026_09_21-16_13_00",
+    "image_topic": "/camera_2/image_rect",
+    "intensity_channel": "intensity",
+    "points_topic": "/livox/lidar"
+  },
+  "results": {
+    "T_lidar_camera": [
+      -0.09999817939103264,
+      0.03972809207282204,
+      0.24012245612069705,
+      0.4302481239571029,
+      0.5607390378449749,
+      0.5611875391960113,
+      0.430728254377642
+    ],
+    "init_T_lidar_camera": [
+      -0.1,
+      0.04,
+      0.24,
+      0.4304593,
+      0.5609855,
+      0.5609855,
+      0.4304593
+    ]
+  }
+}

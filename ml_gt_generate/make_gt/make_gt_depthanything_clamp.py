@@ -21,10 +21,10 @@ Pipeline
 --------
   1. DA-V2 on the LEFT rect image        -> relative disparity (left grid).
   2. Warp RealSense infra1 depth -> left -> dense metric anchors (left grid).
-  3. Robust affine or isotonic-PCHIP fit DA(left) -> dense metric depth.
-  4. Keep exact metric targets through 15 m; mark farther/sky pixels as 19 m.
-  5. Export separate metric_valid_mask and far_mask supervision masks.
-  6. Per-step montage + up/down compare of the (GT, disparity) pair.
+  3. Near-weighted MSE affine fit DA(left) -> dense metric depth.
+  4. Keep exact metric targets through 20 m; mark far as 19 m and sky as 20 m.
+  5. Export separate metric_valid_mask, far_mask, and sky_mask supervision masks.
+  6. Export a 3x4 fitting, mask, depth, overlay, and residual montage.
 
 Deps: rosbags, numpy, opencv-python, torch, transformers, pillow
 Output NPZ content in the bottom of the code
@@ -35,6 +35,7 @@ import os
 import re
 from collections import deque
 from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
@@ -42,11 +43,12 @@ from rosbags.highlevel import AnyReader
 from rosbags.typesys import Stores, get_typestore
 from gt_fitting import select_fit_validation_masks, robust_affine_invdepth, _pava_increasing, _pchip_slopes, _pchip_evaluate, isotonic_pchip_invdepth, validation_depth_statistics, step3_fit_metric_L
 
+ML_GT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ML_GT_ROOT))
+from tools.correct_matrix_direction import load_d455_d435, load_left_d455
 try:
-    from .correct_matrix_direction import load_d455_d435, load_left_d455
     from .ege_ncnn_sky import EgeNcnnSkySegmenter
-except ImportError:  # direct execution: python3 sml/make_gt/make_gt_depthanything.py
-    from correct_matrix_direction import load_d455_d435, load_left_d455
+except ImportError:  # direct execution
     from ege_ncnn_sky import EgeNcnnSkySegmenter
 
 TYPESTORE = get_typestore(Stores.ROS2_HUMBLE)
@@ -189,6 +191,33 @@ D435_D2C_t = np.array([0.014820273034274578, -0.00016969414718914777, 0.00032040
 TOPIC_D435_DEPTH = "/d435/d435_node/aligned_depth_to_color/image_raw"   # color frame
 TOPIC_D435_DEPTH_RAW = "/d435/d435_node/depth/image_rect_raw"           # infra1 frame
 
+_RUNTIME_DEFAULTS = {
+    "CAM0_PROJ": CAM0_PROJ.copy(),
+    "CAM1_PROJ": CAM1_PROJ.copy(),
+    "CAM1_DIST": CAM1_DIST.copy(),
+    "T_LI": T_LI.copy(),
+    "T_I435_I455": T_I435_I455.copy(),
+    "TOPIC_DEPTH": TOPIC_DEPTH,
+    "TOPIC_DEPTH_INFO": TOPIC_DEPTH_INFO,
+    "TOPIC_LEFT": TOPIC_LEFT,
+    "TOPIC_DISP": TOPIC_DISP,
+}
+
+
+def reset_runtime_defaults():
+    """Prevent one multibag config leaking calibration into the next."""
+    global CAM0_PROJ, CAM1_PROJ, CAM1_DIST, T_LI, T_I435_I455
+    global TOPIC_DEPTH, TOPIC_DEPTH_INFO, TOPIC_LEFT, TOPIC_DISP
+    CAM0_PROJ = _RUNTIME_DEFAULTS["CAM0_PROJ"].copy()
+    CAM1_PROJ = _RUNTIME_DEFAULTS["CAM1_PROJ"].copy()
+    CAM1_DIST = _RUNTIME_DEFAULTS["CAM1_DIST"].copy()
+    T_LI = _RUNTIME_DEFAULTS["T_LI"].copy()
+    T_I435_I455 = _RUNTIME_DEFAULTS["T_I435_I455"].copy()
+    TOPIC_DEPTH = _RUNTIME_DEFAULTS["TOPIC_DEPTH"]
+    TOPIC_DEPTH_INFO = _RUNTIME_DEFAULTS["TOPIC_DEPTH_INFO"]
+    TOPIC_LEFT = _RUNTIME_DEFAULTS["TOPIC_LEFT"]
+    TOPIC_DISP = _RUNTIME_DEFAULTS["TOPIC_DISP"]
+
 
 def compose_T_L_from_D435color(T_c455_i455):
     """T_{L<-D435color} = T_LI . inv(T_{C455<-I455}) . T_{C455<-D435c}."""
@@ -318,6 +347,58 @@ def load_da_v2(model_id, device):
     return proc, model
 
 
+class GTProcessor:
+    """Reusable model cache for sequential single- or multi-bag processing."""
+
+    def __init__(self):
+        self._da_models = {}
+        self._sky_models = {}
+
+    def load_da_v2(self, model_id, device):
+        key = (str(model_id), str(device))
+        if key not in self._da_models:
+            self._da_models[key] = load_da_v2(model_id, device)
+        else:
+            print(f"reusing cached Depth-Anything-V2: {model_id}")
+        return self._da_models[key]
+
+    def load_sky(self, args):
+        key = (
+            str(Path(args.sky_param).resolve()),
+            str(Path(args.sky_bin).resolve()),
+            int(args.sky_size), args.sky_input_name, args.sky_output_name,
+            tuple(args.sky_mean), tuple(args.sky_norm), float(args.sky_thresh),
+            bool(args.sky_invert), bool(args.sky_gpu),
+            bool(args.sky_dynamic_input_scale), bool(args.sky_refine),
+            int(args.sky_refine_radius), float(args.sky_refine_eps),
+            float(args.sky_refine_low), float(args.sky_refine_high),
+            float(args.sky_refine_bias), bool(args.sky_refine_no_bilateral),
+        )
+        if key not in self._sky_models:
+            self._sky_models[key] = EgeNcnnSkySegmenter(
+                args.sky_param, args.sky_bin, size=args.sky_size,
+                input_name=args.sky_input_name,
+                output_name=args.sky_output_name,
+                mean=tuple(args.sky_mean), norm=tuple(args.sky_norm),
+                threshold=args.sky_thresh, invert=args.sky_invert,
+                use_gpu=args.sky_gpu,
+                dynamic_input_scale=args.sky_dynamic_input_scale,
+                refine=args.sky_refine,
+                refine_radius=args.sky_refine_radius,
+                refine_eps=args.sky_refine_eps,
+                refine_low=args.sky_refine_low,
+                refine_high=args.sky_refine_high,
+                refine_bias=args.sky_refine_bias,
+                refine_bilateral=not args.sky_refine_no_bilateral,
+            )
+        else:
+            print(f"reusing cached EGE sky model: {args.sky_param}")
+        return self._sky_models[key]
+
+    def process_bag(self, argv):
+        return main(argv=argv, processor=self)
+
+
 def load_deploy_mask(path, out_hw):
     m = np.load(path)
     if m.ndim == 3:
@@ -386,6 +467,41 @@ def config_path(value, cfg_path):
         return value
     path = Path(value).expanduser()
     return str(path if path.is_absolute() else (cfg_path.parent / path).resolve())
+
+
+def deploy_mask_from_left_topic(left_topic):
+    """Resolve the matching circle/wing mask for old and raw2rect topics."""
+    masks_dir = Path(__file__).resolve().parent.parent / "masks"
+
+    stereo_match = re.fullmatch(
+        r"/stereo_(\d+)_(\d+)/left/image_rect", left_topic)
+    if stereo_match is not None:
+        pair = f"{stereo_match.group(1)}_{stereo_match.group(2)}"
+        mask_path = masks_dir / f"pair_{pair}_circle_fov.npy"
+    else:
+        camera_match = re.fullmatch(r"/camera_(\d+)/image_rect", left_topic)
+        raw2rect_pairs = {
+            "0": "0_3",
+            "1": "1_0",
+            "2": "2_1",
+            "3": "3_2",
+        }
+        if camera_match is None or camera_match.group(1) not in raw2rect_pairs:
+            raise SystemExit(
+                "cannot auto-select FOV mask: --left-topic must match "
+                "'/stereo_<left>_<right>/left/image_rect' or "
+                "'/camera_<0..3>/image_rect'; "
+                f"got {left_topic!r}"
+            )
+        pair = raw2rect_pairs[camera_match.group(1)]
+        # raw2rect currently emits 322x322 images, so use the masks generated
+        # in that native resolution instead of resizing the older 320 masks.
+        mask_path = masks_dir / "322x322" / f"pair_{pair}_circle_fov.npy"
+    if not mask_path.is_file():
+        raise SystemExit(
+            f"auto-selected FOV mask does not exist: {mask_path}"
+        )
+    return str(mask_path)
 
 
 # =========================================================================== #
@@ -961,39 +1077,109 @@ def _tile(img_bgr, title, tile, vmin=None, vmax=None):
     return t
 
 
-def build_montage(left_img, da_L, depth_I, rs_depth_L, anchor_valid, depth_L, info,
-                  fov_mask, gt_valid, disp, tile, dmin, dmax, sky_mask=None,
-                  gt_depth=None, far_mask=None):
+def _minimum_text(depth, valid=None):
+    mask = np.isfinite(depth) & (depth > 0)
+    if valid is not None:
+        mask &= valid
+    return f"min={float(depth[mask].min()):.2f}m" if mask.any() else "min=N/A"
+
+
+def _fit_diagnostic(da_L, rs_depth_L, anchor_valid, info, tile):
+    """Draw DA-relative vs RealSense inverse-depth and affine candidates."""
+    canvas = np.full((tile, tile, 3), 245, dtype=np.uint8)
+    x = da_L[anchor_valid].astype(np.float64)
+    y = (1.0 / rs_depth_L[anchor_valid]).astype(np.float64)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
+    if x.size < 2:
+        return _tile(canvas, "weighted-MSE fit: N/A", tile)
+
+    xlo, xhi = np.percentile(x, [1, 99])
+    ylo, yhi = np.percentile(y, [1, 99])
+    xspan, yspan = max(xhi - xlo, 1e-9), max(yhi - ylo, 1e-9)
+    px = np.clip(((x - xlo) / xspan * (tile - 25)).astype(int), 0, tile - 1)
+    py = np.clip((tile - 1 - (y - ylo) / yspan * (tile - 25)).astype(int),
+                 22, tile - 1)
+
+    s, t = info.get("s", np.nan), info.get("t", np.nan)
+    if np.isfinite(s) and np.isfinite(t):
+        residual = y - (s * x + t)
+        center = np.median(residual)
+        mad = 1.4826 * np.median(np.abs(residual - center)) + 1e-9
+        inlier = np.abs(residual - center) < 2.5 * mad
+    else:
+        inlier = np.ones(x.shape, dtype=bool)
+    show = np.linspace(0, x.size - 1, min(4000, x.size)).astype(int)
+    for index in show:
+        color = (40, 150, 40) if inlier[index] else (40, 40, 220)
+        canvas[py[index], px[index]] = color
+
+    def draw_line(slope, shift, color, width=1):
+        yy0, yy1 = slope * xlo + shift, slope * xhi + shift
+        p0 = (0, int(np.clip(tile - 1 - (yy0 - ylo) / yspan * (tile - 25), 22, tile - 1)))
+        p1 = (tile - 1, int(np.clip(tile - 1 - (yy1 - ylo) / yspan * (tile - 25), 22, tile - 1)))
+        cv2.line(canvas, p0, p1, color, width, cv2.LINE_AA)
+
+    candidate_colors = ((255, 120, 0), (180, 0, 180), (0, 170, 220), (180, 120, 0))
+    # fit_candidates are the five lowest-MSE legal hypotheses evaluated by
+    # weighted_mse_affine_invdepth(). Index 0 is the selected final line.
+    candidates = info.get("fit_candidates", [])
+    for candidate, color in zip(candidates[1:5], candidate_colors):
+        draw_line(candidate["s"], candidate["t"], color)
+    if np.isfinite(s) and np.isfinite(t):
+        draw_line(s, t, (0, 0, 0), 2)
+    wmse = info.get("weighted_invdepth_mse", np.nan)
+    title = f"weighted-MSE fit | mse={wmse:.3g}"
+    return _tile(canvas, title, tile)
+
+
+def _residual_map(depth_L, rs_depth_L, anchor_valid, max_error=2.0):
+    valid = (anchor_valid & np.isfinite(depth_L) & np.isfinite(rs_depth_L))
+    residual = np.zeros(depth_L.shape, dtype=np.float32)
+    residual[valid] = np.abs(depth_L[valid] - rs_depth_L[valid])
+    normalized = np.clip(residual / max(float(max_error), 1e-6), 0, 1)
+    color = cv2.applyColorMap((normalized * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    color[~valid] = 30
+    return color
+
+
+def _combined_mask_bgr(valid_mask, far_mask, sky_mask, fov_mask):
+    # Outside FOV=dark gray, unlabelled=dark, metric=black, far=gray, sky=white.
+    out = np.full((*valid_mask.shape, 3), 48, dtype=np.uint8)
+    out[~fov_mask] = 24
+    out[valid_mask] = 0
+    out[far_mask] = 127
+    out[sky_mask] = 255
+    return out
+
+
+def build_montage(left_img, da_L, d455_depth_L, d435_depth_L, rs_depth_L,
+                  anchor_valid, depth_L, info, fov_mask, gt_valid, disp, tile,
+                  dmin, dmax, sky_mask=None, gt_depth=None, far_mask=None,
+                  supervised_mask=None):
     left_bgr = _to_bgr(left_img)
     da_rel = _rel_bgr(da_L)
-    depthI_col = _depth_bgr(depth_I, np.isfinite(depth_I) & (depth_I > 0), dmin, dmax)
-    rs_anchor = _depth_bgr(rs_depth_L, anchor_valid, dmin, dmax)
+    d455_valid = np.isfinite(d455_depth_L) & (d455_depth_L > 0)
+    d435_valid = np.isfinite(d435_depth_L) & (d435_depth_L > 0)
+    d455_col = _depth_bgr(d455_depth_L, d455_valid, dmin, dmax)
+    d435_col = _depth_bgr(d435_depth_L, d435_valid, dmin, dmax)
     dL = _depth_bgr(depth_L, np.isfinite(depth_L), dmin, dmax)
-    fov = _to_bgr((fov_mask.astype(np.uint8) * 255))
     gt_depth = depth_L if gt_depth is None else gt_depth
     gt_display_valid = gt_valid if far_mask is None else (gt_valid | far_mask)
+    if sky_mask is not None:
+        gt_display_valid |= sky_mask
     gtm = _depth_bgr(gt_depth, gt_display_valid, dmin, dmax)
-    dsp = _rel_bgr(disp, np.isfinite(disp) & (disp > 0))
-    if info.get("mode") == "weighted-mse":
-        fit_txt = (f"3 weighted-MSE s={info.get('s',0):.2f} "
-                   f"t={info.get('t',0):.2f} "
-                   f"mse={info.get('weighted_invdepth_mse',np.nan):.3g}")
-    elif info.get("mode") in ("affine", "isotonic-pchip"):
-        fit_txt = (f"3 {info.get('mode')} s={info.get('s',0):.2f} "
-                   f"t={info.get('t',0):.2f} "
-                   f"inl={info.get('inl',0)*100:.0f}%")
+    if disp is None:
+        dsp = np.full_like(left_bgr, 30)
+        disp_title = "LightStereo: not available"
     else:
-        fit_txt = f"3 out metric(L) x{info.get('ratio',1):.2f}"
-    merged_coverage = float(np.isfinite(rs_depth_L).mean())
-    anchor_txt = (f"2 RS->L merged={merged_coverage*100:.0f}% "
-                  f"anchors={info.get('anchor_count', 0)}")
+        dsp = _rel_bgr(disp, np.isfinite(disp) & (disp > 0))
+        disp_title = "LightStereo disparity"
     val_mae = info.get("val_mae_lt5m", np.nan)
-    val_rel = info.get("val_median_relative_error", np.nan)
     val_mae_txt = "n/a" if not np.isfinite(val_mae) else f"{val_mae:.2f}m"
-    val_rel_txt = "n/a" if not np.isfinite(val_rel) else f"{val_rel*100:.0f}%"
     far_ratio = 0.0 if far_mask is None else float(far_mask.mean())
-    gt_txt = (f"4 GT metric={gt_valid.mean()*100:.0f}% far={far_ratio*100:.0f}% "
-              f"val<5m={val_mae_txt} QC={info.get('qc_status', 'n/a')}")
+    gt_txt = (f"final GT | {_minimum_text(gt_depth, supervised_mask)} "
+              f"valid={gt_valid.mean()*100:.0f}% far={far_ratio*100:.0f}%")
 
     # sky overlay on the left image (cyan = sky)
     if sky_mask is not None and sky_mask.any():
@@ -1005,26 +1191,32 @@ def build_montage(left_img, da_L, depth_I, rs_depth_L, anchor_valid, depth_L, in
         sky_over = left_bgr.copy()
         sky_txt = "sky seg (0%)"
 
+    combined_mask = _combined_mask_bgr(
+        gt_valid, far_mask, sky_mask, fov_mask)
+    overlap = cv2.addWeighted(left_bgr, 0.55, gtm, 0.45, 0)
+    residual = _residual_map(depth_L, rs_depth_L, anchor_valid)
+
     row1 = np.hstack([
-        _tile(left_bgr,    "1 in left rect", tile),
-        _tile(da_rel,      "1 out DA disp (rel)", tile),
-        _tile(depthI_col,  "2 in RS depth (infra1)", tile, dmin, dmax),
-        _tile(rs_anchor, anchor_txt, tile, dmin, dmax),
+        _tile(left_bgr, "camera", tile),
+        _tile(d455_col, f"D455 aligned | {_minimum_text(d455_depth_L)}", tile, dmin, dmax),
+        _tile(d435_col, f"D435 aligned | {_minimum_text(d435_depth_L)}", tile, dmin, dmax),
+        _tile(da_rel, "DA relative", tile),
     ])
     row2 = np.hstack([
-        _tile(dL,  fit_txt, tile, dmin, dmax),
-        _tile(sky_over, sky_txt, tile),
+        _tile(dL, f"fitted GT | {_minimum_text(depth_L)}", tile, dmin, dmax),
+        _tile(combined_mask, "valid=black far=gray sky=white", tile),
         _tile(gtm, gt_txt, tile, dmin, dmax),
-        _tile(dsp, "5 LightStereo disp", tile),
+        _tile(overlap, "camera + final GT", tile),
     ])
-    up = _tile(gtm, "(5) GT masked", tile, dmin, dmax)
-    down = _tile(dsp, "(5) LightStereo disp", tile)
-    w = max(up.shape[1], down.shape[1])
-    padw = lambda t: np.pad(t, ((0, 0), (0, w - t.shape[1]), (0, 0)), constant_values=20)
-    pair = np.vstack([padw(up), padw(down)])
-    W = max(row1.shape[1], row2.shape[1], pair.shape[1])
+    row3 = np.hstack([
+        _fit_diagnostic(da_L, rs_depth_L, anchor_valid, info, tile),
+        _tile(residual, f"anchor residual | 0-{2:.0f}m val<5={val_mae_txt}", tile, 0, 2),
+        _tile(sky_over, sky_txt, tile),
+        _tile(dsp, disp_title, tile),
+    ])
+    W = max(row1.shape[1], row2.shape[1], row3.shape[1])
     padr = lambda r: np.pad(r, ((0, 0), (0, W - r.shape[1]), (0, 0)), constant_values=20)
-    return np.vstack([padr(row1), padr(row2), padr(pair)])
+    return np.vstack([padr(row1), padr(row2), padr(row3)])
 
 
 def fit_is_suspect(depth_L, gt_valid, info, min_spread, min_scale, min_inlier):
@@ -1129,15 +1321,47 @@ def save_npz_exclusive(path, **arrays):
         np.savez_compressed(stream, **arrays)
 
 
+def _yaml_value(value):
+    """Convert argparse/NumPy/Path values to YAML-safe built-in values."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _yaml_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_yaml_value(item) for item in value]
+    return value
+
+
+def write_resolved_config_exclusive(path, args, source_config,
+                                    resolved_calibration):
+    """Save the final GT settings without overwriting an earlier run."""
+    import yaml
+    payload = {
+        "source_gt_config": args.gt_config,
+        "arguments": _yaml_value(vars(args)),
+        "source_config": _yaml_value(source_config),
+        "resolved_calibration": _yaml_value(resolved_calibration),
+    }
+    with open(path, "x", encoding="utf-8") as stream:
+        yaml.safe_dump(payload, stream, sort_keys=False)
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def main():
+def main(argv=None, processor=None):
     global CAM0_PROJ, CAM1_PROJ, CAM1_DIST, T_LI
+
+    reset_runtime_defaults()
+    processor = processor or GTProcessor()
 
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--gt-config")
-    pre_args, _ = pre.parse_known_args()
+    pre_args, _ = pre.parse_known_args(argv)
     gt_cfg, gt_cfg_path = load_gt_config(pre_args.gt_config)
     # Preserve compatibility with older GT configs containing explicit matrices.
     apply_gt_calibration(gt_cfg)
@@ -1164,6 +1388,9 @@ def main():
     ap.add_argument("--stats-csv",
                     default=config_path(io_cfg.get("stats_csv"), gt_cfg_path),
                     help="per-bag CSV path; defaults to VIS_DIR/PREFIX.csv")
+    ap.add_argument("--resolved-config", default=None,
+                    help=("final resolved YAML path; defaults to EXPORT_DIR/PREFIX_"
+                          "resolved_config.yaml, or VIS_DIR when export is disabled"))
     ap.add_argument("--max-pairs", type=int, default=io_cfg.get("max_pairs", 1000))
     ap.add_argument("--frame-interval", "--max-pairs-interval",
                     dest="frame_interval", type=int,
@@ -1200,14 +1427,15 @@ def main():
                     default=calibration_cfg.get(
                         "d435_source", d435_cfg.get("source", "color")))
 
+    configured_deploy_mask = mask_cfg.get(
+        "deploy_mask", gt_cfg.get("deploy_mask", "auto"))
+    if configured_deploy_mask != "auto":
+        configured_deploy_mask = config_path(configured_deploy_mask, gt_cfg_path)
     ap.add_argument(
-        "--deploy-mask",
-        default=config_path(mask_cfg.get(
-            "deploy_mask", gt_cfg.get("deploy_mask")), gt_cfg_path),
-        help="optional .npy FOV mask; without it the whole target image is valid",
+        "--deploy-mask", default=configured_deploy_mask,
+        help=("FOV .npy override; default 'auto' derives pair_<L>_<R>_circle_fov.npy "
+              "from --left-topic"),
     )
-    ap.add_argument("--no-deploy-mask", dest="deploy_mask", action="store_const",
-                    const=None, help="override the GT config and use the whole image")
 
     ap.add_argument("--da-model", default=da_cfg.get(
         "model", "depth-anything/Depth-Anything-V2-Small-hf"))
@@ -1226,38 +1454,42 @@ def main():
                     default=runtime_cfg.get(
                         "d435_time_offset", d435_cfg.get("time_offset", 0.0)))
     ap.add_argument("--dmin", type=float, default=runtime_cfg.get("dmin", 0.2))
-    ap.add_argument("--dmax", type=float, default=runtime_cfg.get("dmax", 15.0))
+    ap.add_argument("--dmax", type=float, default=runtime_cfg.get("dmax", 20.0))
     ap.add_argument("--max-fit-depth", type=float,
-                    default=runtime_cfg.get("max_fit_depth", 10.0))
+                    default=runtime_cfg.get("max_fit_depth", 20.0))
     ap.add_argument("--metric-depth-max", "--gt-max-depth",
                     dest="metric_depth_max", type=float,
-                    default=runtime_cfg.get("metric_depth_max", 15.0),
+                    default=runtime_cfg.get(
+                        "metric_depth_max", runtime_cfg.get("gt_max_depth", 20.0)),
                     help="largest distance supervised as exact metric depth")
     ap.add_argument("--far-depth", type=float,
                     default=runtime_cfg.get("far_depth", 19.0),
                     help="label meaning farther than --metric-depth-max")
+    ap.add_argument("--sky-depth", type=float,
+                    default=runtime_cfg.get("sky_depth", 20.0),
+                    help="separate fixed depth label for sky pixels")
     ap.add_argument("--model-max-depth", type=float,
                     default=runtime_cfg.get("model_max_depth", 20.0),
                     help="expected training-model output ceiling; metadata/safety check")
     ap.add_argument("--fit-mode",
                     choices=["affine", "weighted-mse", "isotonic-pchip"],
-                    default=runtime_cfg.get("fit_mode", "isotonic-pchip"),
+                    default=runtime_cfg.get("fit_mode", "weighted-mse"),
                     help="DA-relative to inverse-metric alignment model")
     ap.add_argument("--d435-merge", choices=["fill", "min"],
                     default=runtime_cfg.get(
-                        "d435_merge", d435_cfg.get("merge", "fill")))
+                        "d435_merge", d435_cfg.get("merge", "min")))
     ap.add_argument("--no-splat", dest="no_splat", action="store_true",
                     default=not runtime_cfg.get("splat", True),
                     help="disable 2x2 splat (leave sub-pixel holes in the warp)")
     ap.add_argument("--splat", dest="no_splat", action="store_false")
     ap.add_argument("--fit-samples", type=int,
-                    default=runtime_cfg.get("fit_samples", 10000),
+                    default=runtime_cfg.get("fit_samples", 15000),
                     help="maximum near-weighted anchors used by RANSAC")
     ap.add_argument("--near-sample-weight", type=float,
                     default=runtime_cfg.get("near_sample_weight", 3.0),
                     help="sampling weight for RealSense anchors at <=5 m")
     ap.add_argument("--ransac-validation-ratio", type=float,
-                    default=runtime_cfg.get("ransac_validation_ratio", 0.2),
+                    default=runtime_cfg.get("ransac_validation_ratio", 0.05),
                     help="near-weighted anchor fraction held out from fitting")
 
     # ---- sky segmentation (NCNN) ----
@@ -1278,6 +1510,11 @@ def main():
                     help="model already outputs probabilities (skip sigmoid)")
     ap.add_argument("--sky-sigmoid", dest="sky_no_sigmoid", action="store_false")
     ap.add_argument("--sky-thresh", type=float, default=sky_cfg.get("threshold", 0.5))
+    ap.add_argument("--sky-dynamic-input-scale", dest="sky_dynamic_input_scale",
+                    action="store_true",
+                    default=sky_cfg.get("dynamic_input_scale", True))
+    ap.add_argument("--sky-no-dynamic-input-scale",
+                    dest="sky_dynamic_input_scale", action="store_false")
     ap.add_argument("--sky-invert", dest="sky_invert", action="store_true",
                     default=sky_cfg.get("invert", False))
     ap.add_argument("--no-sky-invert", dest="sky_invert", action="store_false")
@@ -1327,7 +1564,7 @@ def main():
                     help="override D435 Depth->Color rotation (row-major 3x3)")
     ap.add_argument("--d435-d2c-t", type=float, nargs=3, default=None,
                     help="override D435 Depth->Color translation")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if not args.bag:
         ap.error("--bag is required unless io.bag is set in the GT config")
@@ -1341,18 +1578,26 @@ def main():
         ap.error("--ransac-validation-ratio must be in [0, 1)")
     if args.metric_depth_max <= args.dmin:
         ap.error("--metric-depth-max must be greater than --dmin")
-    if not args.metric_depth_max < args.far_depth < args.model_max_depth:
-        ap.error("require metric-depth-max < far-depth < model-max-depth")
+    if args.metric_depth_max > args.model_max_depth:
+        ap.error("--metric-depth-max cannot exceed --model-max-depth")
+    if not args.dmin < args.far_depth <= args.model_max_depth:
+        ap.error("require dmin < far-depth <= model-max-depth")
+    if not args.dmin < args.sky_depth <= args.model_max_depth:
+        ap.error("require dmin < sky-depth <= model-max-depth")
+    if args.deploy_mask in (None, "auto"):
+        args.deploy_mask = deploy_mask_from_left_topic(args.left_topic)
 
     # CLI paths are relative to the current directory; YAML paths were already
     # resolved relative to gt_config.yaml above.
-    for attr in ("bag", "vis_dir", "export_dir", "stats_csv", "deploy_mask",
+    for attr in ("bag", "vis_dir", "export_dir", "stats_csv", "resolved_config",
+                 "deploy_mask",
                  "left_calib", "d435_calib", "sky_param", "sky_bin"):
         value = getattr(args, attr)
         if value:
             setattr(args, attr, str(Path(value).expanduser().resolve()))
 
     if gt_cfg_path is not None:
+        args.gt_config = str(gt_cfg_path)
         print(f"GT config: {gt_cfg_path}")
 
     left_calibration = None
@@ -1399,6 +1644,11 @@ def main():
     filename_prefix = validate_output_prefix(
         args.output_prefix or output_filename_prefix(args.bag)
     )
+    resolved_config_path = (args.resolved_config or os.path.join(
+        args.export_dir or args.vis_dir,
+        f"{filename_prefix}_resolved_config.yaml"))
+    resolved_config_path = str(Path(resolved_config_path).expanduser().resolve())
+    os.makedirs(os.path.dirname(resolved_config_path) or ".", exist_ok=True)
     stats_csv_path = (args.stats_csv or
                       os.path.join(args.vis_dir, f"{filename_prefix}.csv"))
     os.makedirs(os.path.dirname(stats_csv_path) or ".", exist_ok=True)
@@ -1411,6 +1661,9 @@ def main():
         )
     if os.path.exists(stats_csv_path):
         raise SystemExit(f"Refusing to overwrite existing CSV: {stats_csv_path}")
+    if os.path.exists(resolved_config_path):
+        raise SystemExit(
+            f"Refusing to overwrite resolved config: {resolved_config_path}")
     print(f"Output filename prefix: {filename_prefix}")
     initialize_stats_csv(stats_csv_path)
     print(f"  fitting statistics -> {stats_csv_path}")
@@ -1430,11 +1683,19 @@ def main():
         topics.append(args.d435_depth)
     if args.d435_info:
         topics.append(args.d435_info)
+    with AnyReader([Path(args.bag)], default_typestore=TYPESTORE) as reader:
+        available_topics = {connection.topic for connection in reader.connections}
+    disparity_available = args.disp_topic in available_topics
+    anchor_topic = args.disp_topic if disparity_available else args.left_topic
+    if not disparity_available:
+        print(f"  optional LightStereo topic '{args.disp_topic}' is absent; "
+              "using left-image timestamps and skipping its montage panel")
+
     print("reading bag...")
     data, scanned_counts = load_topics_sampled(
         args.bag,
         topics,
-        args.disp_topic,
+        anchor_topic,
         args.frame_interval,
         args.sync_tol,
         {
@@ -1447,7 +1708,7 @@ def main():
     for t in topics:
         print(f"  {t}: scanned={scanned_counts[t]} retained={len(data[t])}")
 
-    for required_topic in (args.d455_depth, args.left_topic, args.disp_topic):
+    for required_topic in (args.d455_depth, args.left_topic):
         if not data.get(required_topic):
             raise SystemExit(
                 f"ERROR: required topic '{required_topic}' has 0 messages. "
@@ -1473,7 +1734,7 @@ def main():
     print(f"  T_L<-I translation = {np.round(T_LI[:3,3],4)}")
 
     print("loading Depth-Anything-V2...")
-    proc, model = load_da_v2(args.da_model, device)
+    proc, model = processor.load_da_v2(args.da_model, device)
 
     out_hw = image_to_numpy(data[args.left_topic][0][1]).shape[:2]
     print(f"  stereo-left size (HxW) = {out_hw}  device={device}")
@@ -1483,7 +1744,7 @@ def main():
         deploy_mask = load_deploy_mask(args.deploy_mask, out_hw)
         print(f"  deploy mask {args.deploy_mask}: coverage {100*deploy_mask.mean():.1f}%")
     else:
-        print("  no --deploy-mask: using the whole target image as the FOV.")
+        raise RuntimeError("circle/wing FOV mask is required")
 
     # sky segmentation
     sky_seg = None
@@ -1492,16 +1753,7 @@ def main():
     elif args.sky_heuristic:
         print("  sky: brightness/texture heuristic")
     elif args.sky_param and args.sky_bin:
-        sky_seg = EgeNcnnSkySegmenter(
-            args.sky_param, args.sky_bin, size=args.sky_size,
-            input_name=args.sky_input_name, output_name=args.sky_output_name,
-            mean=tuple(args.sky_mean), norm=tuple(args.sky_norm),
-            threshold=args.sky_thresh,
-            invert=args.sky_invert, use_gpu=args.sky_gpu,
-            refine=args.sky_refine, refine_radius=args.sky_refine_radius,
-            refine_eps=args.sky_refine_eps, refine_low=args.sky_refine_low,
-            refine_high=args.sky_refine_high, refine_bias=args.sky_refine_bias,
-            refine_bilateral=not args.sky_refine_no_bilateral)
+        sky_seg = processor.load_sky(args)
         print(f"  sky: NCNN model {args.sky_param}"
               + (" + guided refinement" if args.sky_refine else ""))
     else:
@@ -1573,13 +1825,28 @@ def main():
               f"T_L<-D435 t={np.round(T_L_D435[:3,3],4)}  "
               f"dist={'color radtan' if d435_src_dist is not None else 'none (pinhole)'}")
 
+    resolved_calibration = {
+        "output_hw": list(out_hw),
+        "left_intrinsics": CAM1_PROJ,
+        "left_distortion": CAM1_DIST,
+        "d455_intrinsics": K_I,
+        "T_left_from_d455": T_LI,
+        "d435_enabled": d435_enabled,
+        "d435_intrinsics": K_d435 if d435_enabled else None,
+        "d435_distortion": d435_src_dist if d435_enabled else None,
+        "T_left_from_d435": T_L_D435 if d435_enabled else None,
+    }
+    write_resolved_config_exclusive(
+        resolved_config_path, args, gt_cfg, resolved_calibration)
+    print(f"  resolved config -> {resolved_config_path}")
+
     n = 0
     n_suspect = 0
     n_skipped_sync = 0
     n_skipped_anchors = 0
     n_skipped_fit = 0
     selected_frames = 0
-    for source_frame, (t_anchor, disp_msg) in enumerate(data[args.disp_topic]):
+    for source_frame, (t_anchor, anchor_msg) in enumerate(data[anchor_topic]):
         if n >= args.max_pairs:
             break
         selected_frames += 1
@@ -1588,7 +1855,7 @@ def main():
         lm = nearest(data[args.left_topic], t_anchor, args.sync_tol)
         if dm is None or lm is None:
             if n_skipped_sync < 5:
-                print(f"  [skip @ disp t={t_anchor:.3f}] "
+                print(f"  [skip @ anchor t={t_anchor:.3f}] "
                       f"depth={'MISS' if dm is None else 'ok'} "
                       f"left={'MISS' if lm is None else 'ok'}")
             n_skipped_sync += 1
@@ -1596,15 +1863,18 @@ def main():
 
         depth_I = image_to_numpy(dm[1]).astype(np.float32) * args.depth_scale   # infra1 frame
         left = image_to_numpy(lm[1])
-        disp = image_to_numpy(disp_msg).astype(np.float32)
-        if disp.ndim == 3:
-            print("  disparity is 3-channel (colorized); log raw 32FC1. skipping.")
-            continue
-
-        disp_L = disp
-        if disp.shape != out_hw:
-            disp_L = cv2.resize(disp, (out_hw[1], out_hw[0]), interpolation=cv2.INTER_NEAREST)
-        disp_valid_L = np.isfinite(disp_L) & (disp_L > 0)
+        disp_L = None
+        if disparity_available:
+            disp = image_to_numpy(anchor_msg).astype(np.float32)
+            if disp.ndim == 2:
+                disp_L = disp
+                if disp.shape != out_hw:
+                    disp_L = cv2.resize(
+                        disp, (out_hw[1], out_hw[0]),
+                        interpolation=cv2.INTER_NEAREST)
+            elif source_frame == 0:
+                print("  LightStereo disparity is not scalar 32FC1; "
+                      "skipping its montage panel")
 
         # ---- STEP 1 ----
         da_L = step1_da_on_left(proc, model, left, device)
@@ -1644,8 +1914,6 @@ def main():
 
         anchor_valid = (np.isfinite(rs_depth_L) & (rs_depth_L > args.dmin)
                         & (rs_depth_L < args.max_fit_depth) & fov & ~sky_mask)
-        # anchor_valid = (np.isfinite(rs_depth_L) & (rs_depth_L > args.dmin)
-        #                 & (rs_depth_L < args.max_fit_depth) & disp_valid_L & ~sky_mask)
         if anchor_valid.sum() < 50:
             if n_skipped_anchors < 5:
                 print(f"  [skip @ disp t={t_anchor:.3f}] "
@@ -1676,16 +1944,17 @@ def main():
         da_far_threshold = info.get("da_far_threshold", np.nan)
         if not args.da_metric and np.isfinite(da_far_threshold):
             far_from_da = np.isfinite(da_L) & (da_L <= da_far_threshold)
-        far_mask = (fov & (sky_mask | far_from_da |
+        far_mask = (fov & ~sky_mask & (far_from_da |
                     (np.isfinite(depth_L) &
                      (depth_L > args.metric_depth_max))))
         metric_valid = (fov & np.isfinite(depth_L) & (depth_L > args.dmin)
                         & (depth_L <= args.metric_depth_max)
                         & ~sky_mask & ~far_mask)
-        supervised_mask = metric_valid | far_mask
-        gt_final = np.full(out_hw, np.nan, dtype=np.float32)
+        supervised_mask = metric_valid | far_mask | sky_mask
+        gt_final = np.zeros(out_hw, dtype=np.float32)
         gt_final[metric_valid] = depth_L[metric_valid]
         gt_final[far_mask] = np.float32(args.far_depth)
+        gt_final[sky_mask] = np.float32(args.sky_depth)
 
         suspect, reasons = (False, [])
         if args.qc_enabled:
@@ -1737,10 +2006,12 @@ def main():
         })
 
         # ---- STEP 6 (viz) ----
-        montage = build_montage(left, da_L, depth_I, rs_depth_L, anchor_valid,
-                                depth_L, info, fov, metric_valid, disp_L,
+        montage = build_montage(left, da_L, d455_depth_L, d435_depth_L,
+                                rs_depth_L, anchor_valid, depth_L, info,
+                                fov, metric_valid, disp_L,
                                 args.tile, args.dmin, args.dmax, sky_mask=sky_mask,
-                                gt_depth=gt_final, far_mask=far_mask)
+                                gt_depth=gt_final, far_mask=far_mask,
+                                supervised_mask=supervised_mask)
         output_stem = f"{filename_prefix}_{n + 1}"
         write_png_exclusive(
             os.path.join(vis_dir, f"{output_stem}.png"), montage)
@@ -1762,6 +2033,7 @@ def main():
                 da_relative=da_L.astype(np.float32),
                 metric_depth_max=np.float32(args.metric_depth_max),
                 far_depth=np.float32(args.far_depth),
+                sky_depth=np.float32(args.sky_depth),
                 model_max_depth=np.float32(args.model_max_depth),
                 # has_disp=np.bool_(True),
                 stamp=np.float64(t_anchor),
@@ -1803,6 +2075,13 @@ def main():
     if args.qc_enabled:
         print(f"QC: {n - n_suspect} kept, {n_suspect} moved to "
               f"{args.qc_subdir}/")
+    return {
+        "kept": n,
+        "review": n_suspect,
+        "sync_miss": n_skipped_sync,
+        "anchor_skip": n_skipped_anchors,
+        "fit_skip": n_skipped_fit,
+    }
 
 
 if __name__ == "__main__":

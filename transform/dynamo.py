@@ -18,6 +18,16 @@ python3 transform/dynamo.py export \
   --metric outdoor \
   --output checkpoints/depth_anything_v2_metric_vkitti_vits.onnx
 
+custom trained metric checkpoint (dynamic batch, static 322x322 image):
+python3 transform/dynamo.py export \
+  --custom \
+  --checkpoint metric_depth/out_data/runs/RUN_NAME/best.pt \
+  --encoder vits \
+  --batch-size 0 \
+  --height 322 \
+  --width 322 \
+  --output metric_depth/out_data/runs/RUN_NAME/best_dynamic_b322.onnx
+
 inference: 
 python3 transform/dynamo.py infer \
     checkpoints/depth_anything_v2_vits_dynamic.onnx \
@@ -42,7 +52,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 from depth_anything_v2.config import Encoder, Metric
 from depth_anything_v2.dpt import DepthAnythingV2 as RelativeDepthAnythingV2
-from metric_depth.depth_anything_v2.dpt import (
+from metric_depth.model_metric_depth.dpt import (
     DepthAnythingV2 as MetricDepthAnythingV2,
 )
 
@@ -91,6 +101,23 @@ def export(
     encoder: Annotated[Encoder, typer.Option()] = Encoder.vits,
     metric: Annotated[
         Optional[Metric], typer.Option(help="Export metric depth models.")
+    ] = None,
+    custom: Annotated[
+        bool,
+        typer.Option(
+            "--custom",
+            help="Use the local custom metric-depth architecture.",
+        ),
+    ] = False,
+    checkpoint_path: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--checkpoint",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+            help="Weights to load; required with --custom.",
+        ),
     ] = None,
     output: Annotated[
         Optional[Path],
@@ -149,19 +176,36 @@ def export(
     ] = False,
 ):
     """Export Depth-Anything V2 using TorchDynamo."""
-    if encoder != Encoder.vits:
+    if encoder != Encoder.vits and not custom:
         raise typer.BadParameter(
             "Only the local vits checkpoint is available; use --encoder vits.",
             param_hint="--encoder",
         )
-    if metric is not None and (height == 0 or width == 0):
+    if custom and metric is not None:
+        raise typer.BadParameter(
+            "--custom and --metric select different model architectures; "
+            "use only one.",
+            param_hint="--custom/--metric",
+        )
+    if custom and checkpoint_path is None:
+        raise typer.BadParameter(
+            "--checkpoint is required with --custom.",
+            param_hint="--checkpoint",
+        )
+    if not custom and checkpoint_path is not None:
+        raise typer.BadParameter(
+            "--checkpoint is reserved for --custom so architecture and "
+            "weights are selected explicitly.",
+            param_hint="--checkpoint",
+        )
+    if (metric is not None or custom) and (height == 0 or width == 0):
         raise typer.BadParameter(
             "Metric export requires static --height and --width with the "
             "legacy tracer; use the 518x518 defaults.",
             param_hint="--height/--width",
         )
-    checkpoint = LOCAL_CHECKPOINTS[metric]
-    if not checkpoint.is_file():
+    checkpoint = checkpoint_path if custom else LOCAL_CHECKPOINTS[metric]
+    if checkpoint is None or not checkpoint.is_file():
         raise FileNotFoundError(
             f"Local checkpoint not found: {checkpoint}"
         )
@@ -172,28 +216,94 @@ def export(
         )
 
     if output is None:
+        model_kind = "custom_metric" if custom else str(encoder)
         output = (
             PROJECT_DIR
             / "checkpoints"
-            / f"depth_anything_v2_{encoder}_{opset}.{format}"
+            / f"depth_anything_v2_{model_kind}_{opset}.{format}"
         )
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    config = encoder.get_config(metric)
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    checkpoint_model_config = None
+    if custom:
+        if not isinstance(payload, dict) or "model" not in payload:
+            raise ValueError(
+                "Custom checkpoint must contain a 'model' state_dict.")
+        state_dict = payload["model"]
+        checkpoint_model_config = payload.get("model_config")
+        checkpoint_encoder = payload.get("encoder")
+        if checkpoint_encoder is not None and checkpoint_encoder != encoder.value:
+            raise ValueError(
+                f"Checkpoint encoder={checkpoint_encoder!r}, but "
+                f"--encoder={encoder.value!r}")
+        max_depth = float(payload.get("max_depth", 20.0))
+        checkpoint_size = payload.get("img_size")
+        if checkpoint_size is not None and (height, width) != (
+                int(checkpoint_size), int(checkpoint_size)):
+            typer.echo(
+                f"Warning: checkpoint trained at {checkpoint_size}x"
+                f"{checkpoint_size}, exporting at {height}x{width}.")
+        architecture_metric = Metric.indoor
+    else:
+        state_dict = payload
+        max_depth = None
+        architecture_metric = metric
+
+    config = encoder.get_config(architecture_metric)
     model_args = {
         "encoder": encoder.value,
         "features": config.features,
         "out_channels": config.out_channels,
     }
-    if metric is None:
+    if metric is None and not custom:
         model = RelativeDepthAnythingV2(**model_args)
     else:
-        max_depth = 20.0 if metric == Metric.indoor else 80.0
-        model = MetricDepthAnythingV2(**model_args, max_depth=max_depth)
-        typer.echo(f"Metric model: {metric.value}, max_depth={max_depth:g} m")
+        if not custom:
+            max_depth = 20.0 if metric == Metric.indoor else 80.0
+        metric_model_class = MetricDepthAnythingV2
+        if custom and checkpoint_model_config:
+            architecture_id = checkpoint_model_config.get("architecture_id")
+            if architecture_id == "fisheye_metric_dpt_custom_softplus_v1":
+                from metric_depth.model_metric_depth.dpt_custom import (
+                    DepthAnythingV2 as CustomFileMetricDepthAnythingV2,
+                )
+                metric_model_class = CustomFileMetricDepthAnythingV2
+            elif architecture_id not in (
+                None,
+                "fisheye_metric_softplus_v1",
+            ):
+                raise ValueError(
+                    f"Unsupported custom checkpoint architecture: "
+                    f"{architecture_id!r}. Register its model class in "
+                    "transform/dynamo.py before export."
+                )
+        elif custom and "depth_head.scratch.output_conv2.0.weight" in state_dict:
+            # Legacy locally-trained checkpoints predate model_config. Their
+            # flat output_conv2 keys identify the official sigmoid DPT head;
+            # the newer Softplus head uses output_conv2.0.0/.0.2 instead.
+            from metric_depth.model_metric_depth.dpt_vkitti import (
+                VKITTIDepthAnythingV2,
+            )
+            metric_model_class = VKITTIDepthAnythingV2
+            typer.echo(
+                "Legacy checkpoint head detected: metric sigmoid "
+                f"with max_depth={max_depth:g} m"
+            )
+        model = metric_model_class(**model_args, max_depth=max_depth)
+        model_label = "custom" if custom else metric.value
+        typer.echo(f"Metric model: {model_label}, max_depth={max_depth:g} m")
+    if custom and checkpoint_model_config:
+        saved_id = checkpoint_model_config.get("architecture_id")
+        expected_id = getattr(model, "ARCHITECTURE_ID", None)
+        if saved_id and expected_id and saved_id != expected_id:
+            raise ValueError(
+                f"Checkpoint architecture={saved_id!r}, but --custom currently "
+                f"selects {expected_id!r}. Add/select the matching model class "
+                "before exporting this checkpoint."
+            )
     typer.echo(f"Loading local checkpoint: {checkpoint}")
-    state_dict = torch.load(checkpoint, map_location="cpu")
     model.load_state_dict(state_dict)
     model.eval()
 

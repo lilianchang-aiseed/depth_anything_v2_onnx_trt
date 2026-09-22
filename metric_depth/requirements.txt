@@ -1,5 +1,6 @@
 matplotlib
 opencv-python
 open3d
+PyYAML
 torch
 torchvision

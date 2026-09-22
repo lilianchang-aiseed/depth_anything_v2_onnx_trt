@@ -2,5 +2,8 @@
 /out-dir
 /da_v2_ros2_node
 /da_v2_ros2_node_fisheye/out-dir-ros2/*
+/metric_depth/runs/fisheye_vits*
 /ml_gt_generate/dataset
 /ml_gt_generate/out_data
+/ml_gt_generate/tools/test.ipynb
+**/__pycache__/

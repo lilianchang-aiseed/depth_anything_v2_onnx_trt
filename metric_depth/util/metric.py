@@ -8,6 +8,37 @@ def _masked_mae(abs_diff, target, low, high):
     return torch.mean(abs_diff[mask]).item()
 
 
+def eval_mae_ranges(pred, target, valid_mask, ranges):
+    """Return per-range MAE and supporting GT-pixel counts.
+
+    ``ranges`` is an iterable of ``(name, low, high)``. Membership is decided
+    from the ground-truth depth, never from the prediction. ``high`` is
+    exclusive, so callers can use ``20.000001`` when a 20 m label must be
+    included.
+    """
+    assert pred.shape == target.shape == valid_mask.shape
+    finite = valid_mask.bool() & torch.isfinite(pred) & torch.isfinite(target)
+    abs_diff = torch.abs(pred - target)
+    result = {}
+    for name, low, high in ranges:
+        mask = finite & (target >= low) & (target < high)
+        pixels = int(mask.sum().item())
+        result[f'mae_{name}'] = (
+            float(abs_diff[mask].mean().item()) if pixels else float('nan')
+        )
+        result[f'pixels_{name}'] = pixels
+    return result
+
+
+def _masked_silog(diff_log, target, low, high, lambd=0.5):
+    mask = (target >= low) & (target < high)
+    if not torch.any(mask):
+        return float('nan')
+    values = diff_log[mask]
+    variance = torch.pow(values, 2).mean() - lambd * torch.pow(values.mean(), 2)
+    return torch.sqrt(torch.clamp(variance, min=0)).item()
+
+
 def eval_depth(pred, target, extended=False):
     assert pred.shape == target.shape
 
@@ -56,6 +87,11 @@ def eval_depth(pred, target, extended=False):
             'mae_2_5m': _masked_mae(abs_diff, target, 2.0, 5.0),
             'mae_5_10m': _masked_mae(abs_diff, target, 5.0, 10.0),
             'mae_10_20m': _masked_mae(abs_diff, target, 10.0, 20.000001),
+            'silog_0.2_2m': _masked_silog(diff_log, target, 0.2, 2.0),
+            'silog_2_5m': _masked_silog(diff_log, target, 2.0, 5.0),
+            'silog_5_10m': _masked_silog(diff_log, target, 5.0, 10.0),
+            'silog_10_20m': _masked_silog(
+                diff_log, target, 10.0, 20.000001),
             'median_relative_error': torch.median(relative_error).item(),
             'valid_pixel_count': int(target.numel()),
         })

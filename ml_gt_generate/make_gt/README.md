@@ -155,7 +155,7 @@ T_Left<-D455
 T_D455<-D435
 ```
 
-`correct_matrix_direction.py` reads a two-camera Kalibr `*-camchain.yaml` or
+`../tools/correct_matrix_direction.py` reads a two-camera Kalibr `*-camchain.yaml` or
 `*-results-cam.txt` and normalizes the matrix direction automatically.
 
 The current 0827 config uses:

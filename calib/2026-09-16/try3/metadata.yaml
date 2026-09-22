@@ -1,0 +1,92 @@
+rosbag2_bagfile_information:
+  version: 5
+  storage_identifier: mcap
+  duration:
+    nanoseconds: 96077596693
+  starting_time:
+    nanoseconds_since_epoch: 1789717219523191769
+  message_count: 40563
+  topics_with_message_count:
+    - topic_metadata:
+        name: /mavros/local_position/pose
+        type: geometry_msgs/msg/PoseStamped
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 5\n  reliability: 2\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 2739
+    - topic_metadata:
+        name: /mavros/local_position/velocity_local
+        type: geometry_msgs/msg/TwistStamped
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 5\n  reliability: 2\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 2739
+    - topic_metadata:
+        name: /mavros/local_position/odom
+        type: nav_msgs/msg/Odometry
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 5\n  reliability: 2\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 2739
+    - topic_metadata:
+        name: /mavros/imu/data
+        type: sensor_msgs/msg/Imu
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 5\n  reliability: 2\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 4568
+    - topic_metadata:
+        name: /mavros/local_position/velocity_body
+        type: geometry_msgs/msg/TwistStamped
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 5\n  reliability: 2\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 2739
+    - topic_metadata:
+        name: /camera_2/image_rect
+        type: sensor_msgs/msg/Image
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 1\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 1865
+    - topic_metadata:
+        name: /mavros/time_reference
+        type: sensor_msgs/msg/TimeReference
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 5\n  reliability: 2\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 93
+    - topic_metadata:
+        name: /d455/d455_node/infra1/image_rect_raw
+        type: sensor_msgs/msg/Image
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 1\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 1441
+    - topic_metadata:
+        name: /diagnostics
+        type: diagnostic_msgs/msg/DiagnosticArray
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 1\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false\n- history: 1\n  depth: 1\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 191
+    - topic_metadata:
+        name: /tf
+        type: tf2_msgs/msg/TFMessage
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 100\n  reliability: 1\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 2740
+    - topic_metadata:
+        name: /mavros/imu/data_raw
+        type: sensor_msgs/msg/Imu
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 5\n  reliability: 2\n  durability: 2\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 18707
+    - topic_metadata:
+        name: /tf_static
+        type: tf2_msgs/msg/TFMessage
+        serialization_format: cdr
+        offered_qos_profiles: "- history: 1\n  depth: 1\n  reliability: 1\n  durability: 1\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false\n- history: 1\n  depth: 1\n  reliability: 1\n  durability: 1\n  deadline:\n    sec: 9223372036\n    nsec: 854775807\n  lifespan:\n    sec: 9223372036\n    nsec: 854775807\n  liveliness: 1\n  liveliness_lease_duration:\n    sec: 9223372036\n    nsec: 854775807\n  avoid_ros_namespace_conventions: false"
+      message_count: 2
+  compression_format: ""
+  compression_mode: ""
+  relative_file_paths:
+    - flight_data_2026_09_18-15_40_18_0.mcap
+  files:
+    - path: flight_data_2026_09_18-15_40_18_0.mcap
+      starting_time:
+        nanoseconds_since_epoch: 1789717219523191769
+      duration:
+        nanoseconds: 96077596693
+      message_count: 40563
