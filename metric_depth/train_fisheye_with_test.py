@@ -579,6 +579,7 @@ def _test_frame_record(sample_index, sample, pred, depth, valid, far, args):
         'row_type': 'frame',
         'sample_index': sample_index,
         'image_path': str(image_path),
+        'test_frame_count': 1,
         **prefixed_metrics('test', base_metrics),
         **prefixed_metrics('test', range_metrics),
         'test_far_pixel_count': far_pixels,
@@ -590,21 +591,27 @@ def _test_frame_record(sample_index, sample, pred, depth, valid, far, args):
 
 
 def _write_test_perframe_metrics(records, metric_dir):
-    """Write frame rows plus an average/total row at the bottom."""
+    """Write frame rows plus a frame-average summary row at the bottom.
+
+    Metric columns are averaged with equal weight per frame, ignoring NaN
+    values for frames where that metric cannot be evaluated. Pixel/count
+    columns are totals, not averages.
+    """
     if not records:
         return None
     os.makedirs(metric_dir, exist_ok=True)
     output_path = os.path.join(metric_dir, 'test_perframe_metric.csv')
     fields = list(records[0])
     average = {
-        'row_type': 'average',
+        'row_type': 'frame_average',
         'sample_index': '',
-        'image_path': 'ALL_TEST_FRAMES',
+        'image_path': 'FRAME_AVERAGE_ALL_TEST_FRAMES',
     }
     sum_fields = {
         field for field in fields
         if field.startswith('test_pixels_') or field in {
-            'test_valid_pixel_count', 'test_far_pixel_count', 'test_evaluated'
+            'test_frame_count', 'test_valid_pixel_count',
+            'test_far_pixel_count', 'test_evaluated'
         }
     }
     for field in fields[3:]:
