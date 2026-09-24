@@ -29,6 +29,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import time
 
 import cv2
@@ -1073,6 +1074,13 @@ def run_vkitti_comparison(model, checkpoint_path, test_loader, device, args,
 # Training
 # --------------------------------------------------------------------------- #
 def main(argv=None):
+    cli_argv = list(sys.argv[1:] if argv is None else argv)
+
+    def cli_provided(option):
+        """True when an option came from the CLI rather than YAML defaults."""
+        return any(token == option or token.startswith(option + '=')
+                   for token in cli_argv)
+
     config_probe = argparse.ArgumentParser(add_help=False)
     config_probe.add_argument('--config')
     config_probe_args, _ = config_probe.parse_known_args(argv)
@@ -1173,6 +1181,19 @@ def main(argv=None):
     parser.set_defaults(**input_config)
     args = parser.parse_args(argv)
     args.config = input_config_path
+
+    if not args.model_training:
+        # A saved training run config naturally records its original dataset
+        # and train/validation lists.  They are provenance, not requests to
+        # train during a later inference-only reuse.  Clear only values that
+        # were inherited from YAML; explicitly passing any of these options on
+        # the command line remains an error below.
+        for option, dest in (
+                ('--data', 'data'),
+                ('--train-list', 'train_list'),
+                ('--val-list', 'val_list')):
+            if not cli_provided(option):
+                setattr(args, dest, None)
 
     if not args.save_path:
         parser.error('--save-path is required in YAML or CLI')
