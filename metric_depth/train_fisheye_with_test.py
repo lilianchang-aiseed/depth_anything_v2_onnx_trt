@@ -126,7 +126,13 @@ def parse_bool(value):
 
 
 def load_training_config(path):
-    """Load flat argparse defaults from YAML; relative paths use its folder."""
+    """Load argparse defaults from either an input or saved run YAML.
+
+    Saved run configs contain resolved/output metadata in addition to the flat
+    parser inputs.  Normalize the few historical representations here so an
+    old run's ``config.yaml`` can be passed back through ``--config`` without
+    weakening the unknown-key check for genuine input mistakes.
+    """
     if not path:
         return {}, None
     try:
@@ -138,6 +144,42 @@ def load_training_config(path):
         config = yaml.safe_load(stream) or {}
     if not isinstance(config, dict):
         raise SystemExit(f'training config must be a YAML mapping: {config_path}')
+
+    # These keys describe what a completed run resolved or constructed; they
+    # are not argparse inputs and must not become parser defaults.
+    output_only_keys = {
+        'model_structure', 'optimizer', 'resolved_split',
+        'resolved_split_counts', 'loss_details', 'model_description',
+    }
+
+    # Newer saved configs contain both the flat ``model_architecture`` input
+    # and detailed ``model_structure`` metadata.  Some intermediate versions
+    # only wrote the latter, so recover its parser value before discarding it.
+    model_structure = config.get('model_structure')
+    if ('model_architecture' not in config
+            and isinstance(model_structure, dict)
+            and model_structure.get('selection')):
+        config['model_architecture'] = model_structure['selection']
+
+    # Historical run configs replaced the parser's string ``loss`` value with
+    # a descriptive mapping.  Convert it back to the accepted CLI spelling.
+    loss = config.get('loss')
+    if isinstance(loss, dict):
+        loss_name = str(loss.get('name', '')).strip().lower()
+        legacy_loss_names = {
+            'silogloss': 'silog',
+            'silog': 'silog',
+            'rangeweightedsilogloss': 'range-weighted-silog',
+            'range-weighted-silog': 'range-weighted-silog',
+        }
+        if loss_name not in legacy_loss_names:
+            raise SystemExit(
+                f'{config_path}: unsupported saved loss metadata name '
+                f'{loss.get("name")!r}')
+        config['loss'] = legacy_loss_names[loss_name]
+
+    for key in output_only_keys:
+        config.pop(key, None)
 
     config_dir = os.path.dirname(config_path)
     path_keys = {
@@ -238,7 +280,9 @@ def save_run_metadata(args, counts, split_details):
         'lr_schedule': 'polynomial_decay',
         'lr_schedule_power': LR_SCHEDULE_POWER,
     }
-    config['loss'] = {
+    # Keep ``loss`` as the flat parser value so this resolved config remains a
+    # valid future --config input.  Store the expanded record separately.
+    config['loss_details'] = {
         'name': ('SiLogLoss' if args.loss == 'silog'
                  else 'RangeWeightedSiLogLoss'),
         'lambda': SILOG_LAMBDA,

@@ -266,6 +266,13 @@ def read_nearest_depths(bag, targets, sources, sync_tol):
     read_counts = {topic: 0 for topic in topic_to_source}
     print(f"[sync RealSense] sources={','.join(sources) or 'none'}", flush=True)
 
+    # In rosbags, passing an empty connection list to reader.messages() may be
+    # interpreted as no filter and iterate every topic.  Return before opening
+    # the bag so ``--sources lidar`` is a true camera+LiDAR-only workflow.
+    if not sources:
+        print("[sync RealSense] skipped; no RealSense source selected", flush=True)
+        return result, deltas
+
     def retain(topic, index, item):
         if item is None:
             return

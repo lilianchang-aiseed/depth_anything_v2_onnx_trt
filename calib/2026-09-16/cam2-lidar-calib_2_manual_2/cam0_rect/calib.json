@@ -1,0 +1,52 @@
+{
+  "camera": {
+    "camera_model": "plumb_bob",
+    "distortion_coeffs": [
+      -0.0449,
+      0.0271,
+      -0.00124,
+      -0.01193
+    ],
+    "intrinsics": [
+      198.9072,
+      194.2689,
+      121.4513,
+      139.7931
+    ]
+  },
+  "meta": {
+    "bag_names": [
+      "flight_data_2026_09_21-12_14_44_0.mcap"
+    ],
+    "camera_info_topic": "",
+    "data_path": "/files/data/flight_data_2026_09_21-12_14_44",
+    "image_topic": "/camera_0/image_rect",
+    "intensity_channel": "intensity",
+    "points_topic": "/livox/lidar",
+    "derived_from_reference_camera": 2,
+    "intrinsics_source": "/camera_2/image_rect",
+    "camera_rig_calibration": "/home/r12543040/tools_rectify_stereo/Depth-Anything-V2/calib/2026-09-16/stereo_calib_ds-camchain_ar0234.yaml",
+    "reference_camera_lidar_calibration": "/home/r12543040/tools_rectify_stereo/Depth-Anything-V2/calib/2026-09-16/cam2-lidar-calib_2_manual_2/cam2_rect/calib.json",
+    "init_transform_policy": "same_as_derived_final_transform"
+  },
+  "results": {
+    "T_lidar_camera": [
+      -0.8505472819612286,
+      0.04965713399548777,
+      0.1634002461555248,
+      -0.3956454444263123,
+      -0.6081179369903115,
+      0.582819135246268,
+      0.3660315732367165
+    ],
+    "init_T_lidar_camera": [
+      -0.8505472819612286,
+      0.04965713399548777,
+      0.1634002461555248,
+      -0.3956454444263123,
+      -0.6081179369903115,
+      0.582819135246268,
+      0.3660315732367165
+    ]
+  }
+}
